@@ -505,6 +505,42 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(deliverReplies).not.toHaveBeenCalled();
   });
 
+  it("preserves earlier inline buttons when a later final only changes text", async () => {
+    const answerDraftStream = createSequencedDraftStream(1001);
+    const reasoningDraftStream = createDraftStream();
+    const buttons = [[{ text: "Open", callback_data: "open" }]];
+    createTelegramDraftStream
+      .mockImplementationOnce(() => answerDraftStream)
+      .mockImplementationOnce(() => reasoningDraftStream);
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text: "Message A partial" });
+        await replyOptions?.onAssistantMessageStart?.();
+        await replyOptions?.onPartialReply?.({ text: "Message B partial" });
+        await dispatcherOptions.deliver(
+          {
+            text: "Message A final",
+            channelData: { telegram: { buttons } },
+          },
+          { kind: "final" },
+        );
+        await dispatcherOptions.deliver({ text: "Message B final" }, { kind: "final" });
+        return { queuedFinal: true };
+      },
+    );
+    deliverReplies.mockResolvedValue({ delivered: true });
+    editMessageTelegram.mockResolvedValue({ ok: true, chatId: "123", messageId: "1001" });
+
+    await dispatchWithContext({ context: createContext(), streamMode: "partial" });
+
+    expect(editMessageTelegram).toHaveBeenCalledWith(
+      123,
+      1001,
+      "Message A final Message B final",
+      expect.objectContaining({ buttons }),
+    );
+  });
+
   it.each(["partial", "block"] as const)(
     "keeps finalized text preview when the next assistant message is media-only (%s mode)",
     async (streamMode) => {
@@ -1228,6 +1264,21 @@ describe("dispatchTelegramMessage draft streaming", () => {
 
     // Preview contains stale partial text — must be cleaned up
     expect(draftStream.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears stale reasoning preview when streamed turn ends without a final", async () => {
+    const { reasoningDraftStream } = setupDraftStreams({
+      answerMessageId: 999,
+      reasoningMessageId: 111,
+    });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ replyOptions }) => {
+      await replyOptions?.onReasoningStream?.({ text: "Reasoning:\n_step one_" });
+      return { queuedFinal: false };
+    });
+
+    await dispatchWithContext({ context: createReasoningStreamContext(), streamMode: "partial" });
+
+    expect(reasoningDraftStream.clear).toHaveBeenCalledTimes(1);
   });
 
   it("falls back when all finals are skipped and clears preview", async () => {

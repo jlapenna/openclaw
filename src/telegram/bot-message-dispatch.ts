@@ -309,8 +309,22 @@ export const dispatchTelegramMessage = async ({
   const getCurrentAnswerText = () => composeAnswerSegmentsText();
   const getLastAnswerSegment = () => answerSegments[answerSegments.length - 1];
   const getUnfinalizedAnswerSegments = () => answerSegments.filter((segment) => !segment.finalized);
+  const hasBufferedAnswerPayloadMetadata = (payload: ReplyPayload) => {
+    const previewButtons = (
+      payload.channelData?.telegram as { buttons?: TelegramInlineButtons } | undefined
+    )?.buttons;
+    return (
+      Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0 || Boolean(previewButtons)
+    );
+  };
   const bufferAnswerFinal = (payload: ReplyPayload) => {
-    bufferedAnswerFinal = { payload, text: composeAnswerSegmentsText() };
+    const bufferedPayload =
+      bufferedAnswerFinal &&
+      hasBufferedAnswerPayloadMetadata(bufferedAnswerFinal.payload) &&
+      !hasBufferedAnswerPayloadMetadata(payload)
+        ? bufferedAnswerFinal.payload
+        : payload;
+    bufferedAnswerFinal = { payload: bufferedPayload, text: composeAnswerSegmentsText() };
   };
   const createAnswerSegment = (segmentStartsAfterFinal: boolean): AnswerSegmentState => {
     const segment: AnswerSegmentState = {
@@ -754,7 +768,7 @@ export const dispatchTelegramMessage = async ({
       },
     }));
     await flushBufferedAnswerFinal();
-    if (reasoningLane.hasStreamedMessage) {
+    if (queuedFinal && reasoningLane.hasStreamedMessage) {
       finalizedPreviewByLane.reasoning = true;
     }
   } catch (err) {
