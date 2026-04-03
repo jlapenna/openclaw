@@ -267,8 +267,14 @@ export function handleMessageUpdate(
         chunk = content.slice(ctx.state.deltaBuffer.length);
       } else if (ctx.state.deltaBuffer.startsWith(content)) {
         chunk = "";
-      } else if (!ctx.state.deltaBuffer.includes(content)) {
-        chunk = content;
+      } else {
+        // Only accept entirely un-overlapping content if our buffer is totally empty
+        // to prevent duplicate overlapping strings on malformed boundaries.
+        if (ctx.state.deltaBuffer.length === 0) {
+          chunk = content;
+        } else {
+          chunk = "";
+        }
       }
     }
   }

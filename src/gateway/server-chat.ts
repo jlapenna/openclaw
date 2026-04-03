@@ -116,8 +116,12 @@ function resolveMergedAssistantText(params: {
   previousText: string;
   nextText: string;
   nextDelta: string;
+  replace?: boolean;
 }) {
-  const { previousText, nextText, nextDelta } = params;
+  const { previousText, nextText, nextDelta, replace } = params;
+  if (replace) {
+    return nextText;
+  }
   if (nextText && previousText) {
     if (nextText.startsWith(previousText)) {
       return nextText;
@@ -539,6 +543,7 @@ export function createAgentEventHandler({
     seq: number,
     text: string,
     delta?: unknown,
+    replace?: boolean,
   ) => {
     const cleanedText = stripInlineDirectiveTagsForDisplay(text).text;
     const cleanedDelta =
@@ -548,6 +553,7 @@ export function createAgentEventHandler({
       previousText,
       nextText: cleanedText,
       nextDelta: cleanedDelta,
+      replace,
     });
     if (!mergedText) {
       return;
@@ -810,7 +816,16 @@ export function createAgentEventHandler({
         );
       }
       if (!isAborted && evt.stream === "assistant" && typeof evt.data?.text === "string") {
-        emitChatDelta(sessionKey, clientRunId, evt.runId, evt.seq, evt.data.text, evt.data.delta);
+        const replace = typeof evt.data.replace === "boolean" ? evt.data.replace : undefined;
+        emitChatDelta(
+          sessionKey,
+          clientRunId,
+          evt.runId,
+          evt.seq,
+          evt.data.text,
+          evt.data.delta,
+          replace,
+        );
       } else if (!isAborted && (lifecyclePhase === "end" || lifecyclePhase === "error")) {
         const evtStopReason =
           typeof evt.data?.stopReason === "string" ? evt.data.stopReason : undefined;
