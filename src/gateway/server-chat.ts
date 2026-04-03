@@ -555,7 +555,7 @@ export function createAgentEventHandler({
       nextDelta: cleanedDelta,
       replace,
     });
-    if (!mergedText) {
+    if (mergedText === undefined || (mergedText === "" && !replace)) {
       return;
     }
     chatRunState.buffers.set(clientRunId, mergedText);
@@ -570,7 +570,8 @@ export function createAgentEventHandler({
     }
     const now = Date.now();
     const last = chatRunState.deltaSentAt.get(clientRunId) ?? 0;
-    if (now - last < 150) {
+    // Bypass throttle for explicit replacements or final flushes
+    if (!replace && now - last < 150) {
       return;
     }
     chatRunState.deltaSentAt.set(clientRunId, now);
