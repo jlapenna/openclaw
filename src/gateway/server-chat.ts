@@ -120,7 +120,7 @@ function resolveMergedAssistantText(params: {
 }) {
   const { previousText, nextText, nextDelta, replace } = params;
   if (replace) {
-    return nextText;
+    return typeof nextText === "string" ? nextText : "";
   }
   if (nextText && previousText) {
     if (nextText.startsWith(previousText)) {
@@ -555,7 +555,7 @@ export function createAgentEventHandler({
       nextDelta: cleanedDelta,
       replace,
     });
-    if (mergedText === undefined || (mergedText === "" && !replace)) {
+    if (mergedText === "" && !replace) {
       return;
     }
     chatRunState.buffers.set(clientRunId, mergedText);

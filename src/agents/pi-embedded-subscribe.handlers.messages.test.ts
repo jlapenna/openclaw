@@ -182,4 +182,85 @@ describe("handleMessageUpdate", () => {
       expect(debug).toHaveBeenCalledWith("text_end block reply flush failed: Error: boom");
     });
   });
+
+  it("prevents overlapping chunks from duplicating text when buffer is not empty", () => {
+    const ctx = {
+      params: {
+        runId: "run-1",
+        session: { id: "session-1" },
+        onAgentEvent: vi.fn(),
+      },
+      state: {
+        deterministicApprovalPromptSent: false,
+        reasoningStreamOpen: false,
+        streamReasoning: false,
+        deltaBuffer: "I hear you — ",
+        blockBuffer: "",
+        partialBlockState: {
+          thinking: false,
+          final: false,
+          inlineCode: createInlineCodeState(),
+        },
+        lastStreamedAssistantCleaned: undefined,
+        emittedAssistantUpdate: false,
+        shouldEmitPartialReplies: false,
+        blockReplyBreak: "text_end",
+      },
+      log: { debug: vi.fn() },
+      noteLastAssistant: vi.fn(),
+      stripBlockTags: (text: string) => text,
+      consumePartialReplyDirectives: vi.fn(() => null),
+      flushBlockReplyBuffer: vi.fn(),
+    } as unknown as EmbeddedPiSubscribeContext;
+
+    handleMessageUpdate(
+      ctx as never,
+      {
+        type: "message_update",
+        message: { role: "assistant", content: [] },
+        assistantMessageEvent: {
+          type: "text_end",
+          content: "I hear you — ",
+        },
+      } as never,
+    );
+
+    // Because the content doesn't completely overlap a prefix (it exactly matches),
+    // it starts with the deltaBuffer, so chunk = "".
+    // The deltaBuffer should remain "I hear you — "
+    expect(ctx.state.deltaBuffer).toBe("I hear you — ");
+
+    // Now let's test a non-overlapping completely new string (should be appended since it doesn't overlap)
+    handleMessageUpdate(
+      ctx as never,
+      {
+        type: "message_update",
+        message: { role: "assistant", content: [] },
+        assistantMessageEvent: {
+          type: "text_end",
+          content: "Wait a minute",
+        },
+      } as never,
+    );
+
+    // Buffer should append it!
+    expect(ctx.state.deltaBuffer).toBe("I hear you — Wait a minute");
+
+    // Now test if buffer IS empty
+    ctx.state.deltaBuffer = "";
+    handleMessageUpdate(
+      ctx as never,
+      {
+        type: "message_update",
+        message: { role: "assistant", content: [] },
+        assistantMessageEvent: {
+          type: "text_end",
+          content: "Hello",
+        },
+      } as never,
+    );
+
+    // Buffer should accept it!
+    expect(ctx.state.deltaBuffer).toBe("Hello");
+  });
 });

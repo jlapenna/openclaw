@@ -267,14 +267,12 @@ export function handleMessageUpdate(
         chunk = content.slice(ctx.state.deltaBuffer.length);
       } else if (ctx.state.deltaBuffer.startsWith(content)) {
         chunk = "";
-      } else {
-        // Only accept entirely un-overlapping content if our buffer is totally empty
-        // to prevent duplicate overlapping strings on malformed boundaries.
-        if (ctx.state.deltaBuffer.length === 0) {
-          chunk = content;
-        } else {
-          chunk = "";
-        }
+      } else if (!ctx.state.deltaBuffer.includes(content)) {
+        // Fallback: If the content is completely novel (not a prefix and not already inside),
+        // we append it. Note: This heuristic drops overlapping content that spans the start boundary
+        // to prevent doubling, at the intentional risk of truncating valid suffixes if they
+        // happen to partially overlap the end of the buffer.
+        chunk = content;
       }
     }
   }

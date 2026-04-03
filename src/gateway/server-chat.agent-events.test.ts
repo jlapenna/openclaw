@@ -1215,4 +1215,60 @@ describe("agent event handler", () => {
       "Disk usage crossed 95 percent on /data and needs cleanup now.",
     );
   });
+  it("immediately replaces the text buffer when the replace flag is true", () => {
+    let now = 13_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { broadcast, chatRunState, handler } = createHarness();
+    chatRunState.registry.add("run-replace", {
+      sessionKey: "session-replace",
+      clientRunId: "client-replace",
+    });
+
+    handler({
+      runId: "run-replace",
+      seq: 1,
+      stream: "assistant",
+      ts: Date.now(),
+      data: { text: "Typo" },
+    });
+
+    // The agent corrects the entire string and sets replace to true
+    now = 13_050; // Well under the 150ms throttle!
+    handler({
+      runId: "run-replace",
+      seq: 2,
+      stream: "assistant",
+      ts: Date.now(),
+      data: { text: "Fixed string", replace: true },
+    });
+
+    emitLifecycleEnd(handler, "run-replace", 3);
+
+    const chatCalls = chatBroadcastCalls(broadcast);
+    // Should have 3 calls: initial delta, replacement delta (bypass throttle), and final
+    expect(chatCalls).toHaveLength(3);
+    const firstPayload = chatCalls[0]?.[1] as {
+      state?: string;
+      message?: { content?: Array<{ text?: string }> };
+    };
+    const replacementPayload = chatCalls[1]?.[1] as {
+      state?: string;
+      message?: { content?: Array<{ text?: string }> };
+    };
+    const finalPayload = chatCalls[2]?.[1] as {
+      state?: string;
+      message?: { content?: Array<{ text?: string }> };
+    };
+
+    expect(firstPayload.state).toBe("delta");
+    expect(firstPayload.message?.content?.[0]?.text).toBe("Typo");
+
+    expect(replacementPayload.state).toBe("delta");
+    expect(replacementPayload.message?.content?.[0]?.text).toBe("Fixed string");
+
+    expect(finalPayload.state).toBe("final");
+    expect(finalPayload.message?.content?.[0]?.text).toBe("Fixed string");
+
+    nowSpy.mockRestore();
+  });
 });
