@@ -10,6 +10,7 @@ import {
   type AssistantPhase,
 } from "../shared/chat-message-content.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { appendUniqueSuffix } from "../shared/text/join-segments.js";
 import {
   isMessagingToolDuplicateNormalized,
   normalizeTextForComparison,
@@ -286,13 +287,9 @@ export function handleMessageUpdate(
     } else if (content) {
       // KNOWN: Some providers resend full content on `text_end`.
       // We only append a suffix (or nothing) to keep output monotonic.
-      if (content.startsWith(ctx.state.deltaBuffer)) {
-        chunk = content.slice(ctx.state.deltaBuffer.length);
-      } else if (ctx.state.deltaBuffer.startsWith(content)) {
-        chunk = "";
-      } else if (!ctx.state.deltaBuffer.includes(content)) {
-        chunk = content;
-      }
+      chunk = appendUniqueSuffix(ctx.state.deltaBuffer, content, { minOverlap: 10 }).slice(
+        ctx.state.deltaBuffer.length,
+      );
     }
   }
 
