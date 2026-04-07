@@ -5,6 +5,7 @@ import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { createInlineCodeState } from "../markdown/code-spans.js";
+import { appendUniqueSuffix } from "../shared/text/join-segments.js";
 import {
   isMessagingToolDuplicateNormalized,
   normalizeTextForComparison,
@@ -319,8 +320,14 @@ export function handleMessageUpdate(
         chunk = content.slice(ctx.state.deltaBuffer.length);
       } else if (ctx.state.deltaBuffer.startsWith(content)) {
         chunk = "";
-      } else if (!ctx.state.deltaBuffer.includes(content)) {
-        chunk = content;
+      } else {
+        // Fallback: If the content is not completely contained, we append the longest
+        // non-overlapping suffix to prevent duplication of chunk boundaries.
+        // We rely on `appendUniqueSuffix` to semantically merge overlaps (e.g. at word boundaries)
+        // while avoiding the "Book Problem" (bo + ok) or accidental double-letter stripping.
+        chunk = appendUniqueSuffix(ctx.state.deltaBuffer, content).slice(
+          ctx.state.deltaBuffer.length,
+        );
       }
     }
   }

@@ -1,51 +1,59 @@
 import { describe, expect, it } from "vitest";
-import { concatOptionalTextSegments, joinPresentTextSegments } from "./join-segments.js";
+import { appendUniqueSuffix } from "./join-segments.js";
 
-function expectTextSegmentsCase<T>(actual: T, expected: T) {
-  expect(actual).toBe(expected);
-}
-
-function expectJoinedTextSegmentsCase<T>(params: { run: () => T; expected: T }) {
-  expectTextSegmentsCase(params.run(), params.expected);
-}
-
-describe("concatOptionalTextSegments", () => {
-  it.each([
-    { params: { left: "A", right: "B" }, expected: "A\n\nB" },
-    { params: { left: "A", right: "" }, expected: "" },
-    { params: { left: "A" }, expected: "A" },
-    { params: { right: "B" }, expected: "B" },
-    { params: { left: "", right: "B" }, expected: "B" },
-    { params: { left: "" }, expected: "" },
-    { params: { left: "A", right: "B", separator: " | " }, expected: "A | B" },
-  ] as const)("concatenates optional segments %#", ({ params, expected }) => {
-    expectJoinedTextSegmentsCase({
-      run: () => concatOptionalTextSegments(params),
-      expected,
-    });
+describe("appendUniqueSuffix (Boundary-Aware)", () => {
+  it("appends non-overlapping segments", () => {
+    expect(appendUniqueSuffix("hello", " world")).toBe("hello world");
   });
-});
 
-describe("joinPresentTextSegments", () => {
-  it.each([
-    { segments: ["A", undefined, "B"], options: undefined, expected: "A\n\nB" },
-    { segments: ["", undefined, null], options: undefined, expected: undefined },
-    { segments: ["  A  ", "  B  "], options: { trim: true }, expected: "A\n\nB" },
-    {
-      segments: ["A", "   ", "B"],
-      options: { separator: " | " },
-      expected: "A |     | B",
-    },
-    {
-      segments: ["A", "   ", "B"],
-      options: { trim: true, separator: " | " },
-      expected: "A | B",
-    },
-    { segments: ["A", "  B  "], options: { separator: "|" }, expected: "A|  B  " },
-  ] as const)("joins present segments %#", ({ segments, options, expected }) => {
-    expectJoinedTextSegmentsCase({
-      run: () => joinPresentTextSegments(segments, options),
-      expected,
-    });
+  it("merges full word overlaps", () => {
+    // Overlap "you" (length 3). Base has space before "you" -> Boundary!
+    expect(appendUniqueSuffix("I hear you", "you - hello")).toBe("I hear you - hello");
+  });
+
+  it("merges with space boundary in base", () => {
+    // Overlap "am ". Base has space before "am " -> Boundary!
+    expect(appendUniqueSuffix("I am ", "am reading")).toBe("I am reading");
+  });
+
+  it("merges with space boundary in suffix", () => {
+    // Overlap "read". Suffix has space after "read" -> Boundary!
+    expect(appendUniqueSuffix("I am read", "read a book")).toBe("I am read a book");
+  });
+
+  it("resolves the book problem (no merge because no boundaries)", () => {
+    // Overlap "o". Neither "b" nor "k" are boundaries.
+    expect(appendUniqueSuffix("bo", "ok")).toBe("book");
+  });
+
+  it("preserves double letters within words", () => {
+    // Overlap "k". Neither "o" nor "e" are boundaries.
+    expect(appendUniqueSuffix("book", "keeper")).toBe("bookkeeper");
+  });
+
+  it("merges single space overlaps (isolated by string boundaries)", () => {
+    // Overlap " ". Base ends in space, suffix starts with space. Boundary on both sides!
+    expect(appendUniqueSuffix("hello ", " world")).toBe("hello world");
+  });
+
+  it("merges long overlaps regardless of boundaries", () => {
+    const base = "I am a helpful assistant. I can help you with many things.";
+    const suffix = "I am a helpful assistant. I can help you with many things. How can I help?";
+    // Overlap is 58 chars. Merge!
+    expect(appendUniqueSuffix(base, suffix)).toBe(
+      "I am a helpful assistant. I can help you with many things. How can I help?",
+    );
+  });
+
+  it("merges punctuation-based overlaps", () => {
+    // Overlap "...". "." is a boundary.
+    expect(appendUniqueSuffix("Wait...", "... more")).toBe("Wait... more");
+  });
+
+  it("prefers longer valid overlaps", () => {
+    // "banana" + "ananas".
+    // overlap "anana": base[0] is "b" (no), suffix[5] is "s" (no). No.
+    // Result: bananaananas
+    expect(appendUniqueSuffix("banana", "ananas")).toBe("bananaananas");
   });
 });
