@@ -73,10 +73,12 @@ export function appendUniqueSuffix(
       const hasInternalBoundary = /[\s.,!?;:()[\]{}'"]/.test(overlapStr);
       const atBaseBoundary = isBoundary(base[base.length - overlap - 1]);
       const atSuffixBoundary = isBoundary(suffix[overlap]);
+      const isNumericSequence = /^\d+$/.test(overlapStr);
 
       const isLikelyResend =
         overlap >= 15 ||
         hasInternalBoundary ||
+        isNumericSequence ||
         (overlap > 1 && (atBaseBoundary || atSuffixBoundary)) ||
         (overlap === 1 && atBaseBoundary && atSuffixBoundary);
 

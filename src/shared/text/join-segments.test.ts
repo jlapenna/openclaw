@@ -43,4 +43,13 @@ describe("appendUniqueSuffix", () => {
     expect(appendUniqueSuffix("", "hello")).toBe("hello");
     expect(appendUniqueSuffix("hello", "")).toBe("hello");
   });
+
+  it("merges numeric overlaps when forming sequences", () => {
+    // Single digit overlaps
+    expect(appendUniqueSuffix("I have 1", "12")).toBe("I have 12");
+    // Multi-digit overlaps
+    expect(appendUniqueSuffix("Count to 23", "34")).toBe("Count to 234");
+    // Boundary with punctuation
+    expect(appendUniqueSuffix("Price is 5", "5.99 it is.")).toBe("Price is 5.99 it is.");
+  });
 });
