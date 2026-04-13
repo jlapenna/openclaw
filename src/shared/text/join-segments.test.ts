@@ -21,7 +21,7 @@ describe("appendUniqueSuffix", () => {
     expect(appendUniqueSuffix("bo", "ok")).toBe("book");
   });
 
-  it("merges long overlaps regardless of boundaries", () => {
+  it("merges long overlaps (>= 15) regardless of boundaries", () => {
     const longBase = "This is a very long string that should definitely be merged";
     const longSuffix = "long string that should definitely be merged and then some";
     expect(appendUniqueSuffix(longBase, longSuffix)).toBe(
