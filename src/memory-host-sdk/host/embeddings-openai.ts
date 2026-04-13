@@ -29,7 +29,7 @@ export function normalizeOpenAiModel(model: string): string {
     return DEFAULT_OPENAI_EMBEDDING_MODEL;
   }
   const parsed = parseStaticModelRef(trimmed, "openai");
-  return parsed ? parsed.model : trimmed;
+  return parsed && parsed.provider === "openai" ? parsed.model : trimmed;
 }
 
 export async function createOpenAiEmbeddingProvider(
