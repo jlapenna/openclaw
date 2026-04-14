@@ -10,6 +10,7 @@ import {
   type AssistantPhase,
 } from "../shared/chat-message-content.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { appendUniqueSuffix } from "../shared/text/join-segments.js";
 import {
   isMessagingToolDuplicateNormalized,
   normalizeTextForComparison,
@@ -284,14 +285,20 @@ export function handleMessageUpdate(
     if (delta) {
       chunk = delta;
     } else if (content) {
-      // KNOWN: Some providers resend full content on `text_end`.
-      // We only append a suffix (or nothing) to keep output monotonic.
-      if (content.startsWith(ctx.state.deltaBuffer)) {
-        chunk = content.slice(ctx.state.deltaBuffer.length);
-      } else if (ctx.state.deltaBuffer.startsWith(content)) {
+      // KNOWN: Some providers resend full or partial content on `text_end`.
+      // NOTE: This logic intentionally discards `content` if it is already
+      // present anywhere in the `deltaBuffer` to prevent catastrophic
+      // duplication when the provider sends stale partials.
+      if (ctx.state.deltaBuffer.includes(content)) {
         chunk = "";
-      } else if (!ctx.state.deltaBuffer.includes(content)) {
-        chunk = content;
+      } else if (content.startsWith(ctx.state.deltaBuffer)) {
+        chunk = content.slice(ctx.state.deltaBuffer.length);
+      } else {
+        // Appends a unique suffix (or nothing) to keep output monotonic
+        // while avoiding short coincidental overlaps via minOverlap.
+        chunk = appendUniqueSuffix(ctx.state.deltaBuffer, content, { minOverlap: 10 }).slice(
+          ctx.state.deltaBuffer.length,
+        );
       }
     }
   }
