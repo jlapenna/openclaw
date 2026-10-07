@@ -73,6 +73,13 @@ restart the original request. A checkpoint already shown in chat stays in the
 conversation while work continues. A genuine blocker can leave steps pending after
 the check.
 
+If the follow-up composes a new closing answer, it still addresses the user's
+current request, including relevant results and requested attachments. Plan
+reconciliation is not a substitute for that answer, and an earlier checkpoint is
+not a non-streamed caller's final result. The agent reuses current artifacts; it
+does not repeat completed tool effects or automatically carry superseded
+attachments forward. A silent check still retains the previous answer.
+
 Old cards do not restart idle work. Completed, cleared, and note-only replacements
 do not request a check. Cancellation, approval waits, accepted child/media completion handoffs,
 status-only refreshes, and explicit plugin finalization retain their
