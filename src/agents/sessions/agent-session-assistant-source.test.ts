@@ -53,7 +53,8 @@ it("binds delivered blocks to their own committed assistant occurrence without d
     await subscription.waitForPendingEvents();
     const entries = sessionManager
       .getEntries()
-      .filter((entry) => entry.type === "message" && entry.message.role === "assistant");
+      .filter((entry) => entry.type === "message")
+      .filter((entry) => entry.message.role === "assistant");
     expect(entries).toHaveLength(2);
     expect(sources).toHaveLength(2);
     expect(atPublication).toEqual([undefined, undefined]);
