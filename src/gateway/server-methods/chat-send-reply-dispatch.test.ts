@@ -15,7 +15,6 @@ import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.j
 import type { ReplyDispatchOperation } from "../../auto-reply/reply/reply-dispatcher.types.js";
 import {
   appendTranscriptMessageSync,
-  publishTranscriptUpdate,
   readActiveTranscriptEntryAnchor,
   resolveSessionTranscriptDatabasePath,
   replaceSessionEntry,
@@ -35,7 +34,6 @@ import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { projectChatDisplayMessage } from "../chat-display-projection.js";
 import * as sessionTranscriptReaders from "../session-transcript-readers.js";
 import * as sessionStoreReaders from "../session-utils-store-worker.js";
-import { loadSessionEntry } from "../session-utils.js";
 import {
   buildAssistantReplyContentFromInputs,
   extractAssistantDisplayText,
