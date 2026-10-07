@@ -5,6 +5,7 @@ import {
   readNonBlankString,
 } from "@openclaw/normalization-core/string-coerce";
 import type { FailoverReason } from "../agents/failover/signal.js";
+import type { AssistantTranscriptSource } from "../agents/sessions/agent-session-types.js";
 import type { ProgressContinuationCapability } from "../channels/progress-continuation.js";
 import type { HarnessCompletionRecovery } from "../config/sessions/restart-recovery-types.js";
 import type { ReplyToMode } from "../config/types.base.js";
@@ -235,6 +236,8 @@ export type ReplyPayloadMetadata = {
   /** The model failed after a committed recovery compaction in the same turn. */
   postCompactionModelFailure?: true;
   assistantMessageIndex?: number;
+  /** Physical assistant append receipt, retained by reference until persistence settles. */
+  assistantTranscriptSource?: AssistantTranscriptSource;
   /** First index of this block's physical assistant message; each content item advances the index. */
   assistantMessageStartIndex?: number;
   /** Answer to a preceding user input in the same run. */

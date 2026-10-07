@@ -72,7 +72,7 @@ import {
   assistantTranscriptScope,
   publishAssistantTranscriptRewrite,
   rewriteAssistantTranscriptMessageByIdempotencyKey,
-  rewriteAssistantTranscriptMessageByTurnIndexAndMedia,
+  rewriteAssistantTranscriptMessageByIdAndMedia,
 } from "./chat-transcript-persistence.js";
 import {
   buildTtsSupplementTranscriptMarker,
@@ -308,8 +308,8 @@ export function createChatSendReplyDispatch(params: {
     if (ownedIdempotencyKey) {
       return `owned:${ownedIdempotencyKey}`;
     }
-    if (metadata?.assistantMessageIndex !== undefined) {
-      return `index:${metadata.assistantMessageIndex}`;
+    if (metadata?.assistantTranscriptSource) {
+      return `source:${metadata.assistantTranscriptSource.occurrenceId}`;
     }
     return "unkeyed";
   };
@@ -412,6 +412,7 @@ export function createChatSendReplyDispatch(params: {
       agentId,
     });
     const assistantMessageIndex = payloadMetadata?.assistantMessageIndex;
+    const assistantSource = payloadMetadata?.assistantTranscriptSource;
     let rewritten: { messageId: string } | null = null;
     if (ownedTranscriptIdempotencyKey && transcriptScope) {
       // Receipt identity is not authority after asynchronous media preparation.
@@ -436,15 +437,15 @@ export function createChatSendReplyDispatch(params: {
         );
         return;
       }
-    } else if (assistantMessageIndex !== undefined && transcriptScope) {
-      // Embedded runtimes identify their owned turn by message index, not a persisted key.
-      // Require that exact current-turn row and media set so a sibling reply cannot be rewritten.
+    } else if (assistantSource?.messageId && transcriptScope) {
+      // This physical append's receipt settles after streaming callbacks. Stream
+      // indices count content items and restart on retries; they cannot select a row.
       if (assistantTranscriptRewriteState?.sessionId !== sessionId) {
         return;
       }
-      const indexedRewrite = await rewriteAssistantTranscriptMessageByTurnIndexAndMedia({
+      const sourceRewrite = await rewriteAssistantTranscriptMessageByIdAndMedia({
         afterSeq: assistantTranscriptRewriteState.afterSeq,
-        assistantMessageIndex,
+        messageId: assistantSource.messageId,
         content: persistedContentForAppend,
         expectedGeneration: assistantTranscriptRewriteState.generation,
         mediaUrls: sourceMediaUrls,
@@ -452,9 +453,9 @@ export function createChatSendReplyDispatch(params: {
           .length,
         scope: transcriptScope,
       });
-      if (indexedRewrite) {
-        assistantTranscriptRewriteState.generation = indexedRewrite.generation;
-        rewritten = indexedRewrite;
+      if (sourceRewrite) {
+        assistantTranscriptRewriteState.generation = sourceRewrite.generation;
+        rewritten = sourceRewrite;
       }
     }
     if (rewritten && transcriptScope) {
@@ -480,20 +481,13 @@ export function createChatSendReplyDispatch(params: {
       transcriptPayload.text,
       mediaFailures,
     )?.trim();
-    if (
-      assistantMessageIndex === undefined &&
-      mediaNormalizationFailed &&
-      hasOnlyFailureDisplay &&
-      runtimeOwnedText
-    ) {
+    if (!assistantSource && mediaNormalizationFailed && hasOnlyFailureDisplay && runtimeOwnedText) {
       // Agent message_end owns the text row. Without its identity, appending a failure card
       // would duplicate that row; the live broadcast still carries the visible failure.
       return;
     }
     const isRuntimeMediaSupplement =
-      assistantMessageIndex !== undefined &&
-      assistantMessageIndex >= 1 &&
-      !mediaNormalizationFailed &&
+      (assistantSource !== undefined || assistantMessageIndex !== undefined) &&
       !ttsSupplementMarker &&
       !payload.isError &&
       !isReplyPayloadStatusNotice(payload) &&
@@ -512,12 +506,11 @@ export function createChatSendReplyDispatch(params: {
       sessionId,
       storePath: latestStorePath,
       agentId,
-      // Runtime message identity is the dedupe boundary; distinct rows must not collapse
-      // onto the single unkeyed media fallback used by tool/audio-only payloads.
-      idempotencyKey:
-        assistantMessageIndex !== undefined && assistantMessageIndex >= 1
-          ? `${clientRunId}:assistant-media:${assistantMessageIndex}`
-          : `${clientRunId}:assistant-media`,
+      // Even a hook-suppressed append retains its own occurrence. Never invent
+      // row identity from a stream index, or repeat provider text in a supplement.
+      idempotencyKey: assistantSource
+        ? `${clientRunId}:assistant-media:${assistantSource.occurrenceId}`
+        : `${clientRunId}:assistant-media`,
       ttsSupplement: ttsSupplementMarker,
       config: cfg,
       onMessageCommitted: (receipt, acceptCompletion) => {

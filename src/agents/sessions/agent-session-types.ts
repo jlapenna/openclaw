@@ -28,8 +28,16 @@ type AgentSessionCompactionEndEvent = {
   outcome: AgentSessionCompactionOutcome;
 };
 
+/** Live receipt for one physical assistant append; not part of provider or transcript bytes. */
+export type AssistantTranscriptSource = {
+  readonly occurrenceId: string;
+  readonly messageId?: string;
+};
+
 export type AgentSessionEvent =
-  | Exclude<AgentEvent, { type: "agent_end" }>
+  | (Exclude<AgentEvent, { type: "agent_end" }> & {
+      assistantTranscriptSource?: AssistantTranscriptSource;
+    })
   | {
       type: "agent_end";
       messages: AgentMessage[];

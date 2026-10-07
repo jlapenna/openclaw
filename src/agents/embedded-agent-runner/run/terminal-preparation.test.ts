@@ -1,6 +1,10 @@
+import assert from "node:assert/strict";
 import type { AssistantMessage } from "openclaw/plugin-sdk/llm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getReplyPayloadMetadata } from "../../../auto-reply/reply-payload.js";
+import {
+  getReplyPayloadMetadata,
+  setReplyPayloadMetadata,
+} from "../../../auto-reply/reply-payload.js";
 import { createTestAdmittedRunContext } from "../../admitted-run-context.test-support.js";
 import { createZeroUsageFixture } from "../../test-helpers/usage-fixtures.js";
 import {
@@ -477,49 +481,73 @@ describe("prepareEmbeddedRunTerminal", () => {
     });
   });
 
-  it("recovers current final text and tool media after a prompt-timeout race", async () => {
-    const completedText = "Completed answer block before the timeout.";
-    const partialText = "Partial final response before the timeout.";
-    const finalText = "Complete final response after the timeout.";
-    const finalAssistant = {
-      ...assistantMessage("stop"),
-      content: [{ type: "text" as const, text: finalText }],
-    };
-    payloadMocks.buildEmbeddedRunPayloads.mockReturnValueOnce([
-      { text: completedText },
-      { text: partialText },
-    ]);
+  it.each([true, false])(
+    "recovers current final text and tool media with its own source (source=%s)",
+    async (hasSource) => {
+      const completedText = "Completed answer block before the timeout.";
+      const partialText = "Partial final response before the timeout.";
+      const finalText = "Complete final response after the timeout.";
+      const finalAssistant = {
+        ...assistantMessage("stop"),
+        content: [{ type: "text" as const, text: finalText }],
+      };
+      payloadMocks.buildEmbeddedRunPayloads.mockReturnValueOnce([
+        { text: completedText },
+        setReplyPayloadMetadata(
+          { text: partialText },
+          {
+            assistantTranscriptSource: {
+              occurrenceId: "partial-response",
+              messageId: "partial-row",
+            },
+          },
+        ),
+      ]);
 
-    const prepared = await prepareAttempt({
-      attempt: attemptResult({
-        terminal: { kind: "timeout", phase: "prompt", source: "runtime" },
-        assistantTexts: [completedText, partialText],
-        toolMediaUrls: ["https://example.test/recovered-output.png"],
-        lastAssistant: finalAssistant,
-        currentAttemptAssistant: finalAssistant,
+      const prepared = await prepareAttempt({
+        attempt: attemptResult({
+          terminal: { kind: "timeout", phase: "prompt", source: "runtime" },
+          assistantTexts: [completedText, partialText],
+          toolMediaUrls: ["https://example.test/recovered-output.png"],
+          lastAssistant: finalAssistant,
+          currentAttemptAssistant: finalAssistant,
+          currentAttemptCompletedAssistant: finalAssistant,
+          ...(hasSource
+            ? {
+                assistantTranscriptSource: {
+                  occurrenceId: "final-response",
+                  messageId: "final-row",
+                },
+              }
+            : {}),
+        }),
         currentAttemptCompletedAssistant: finalAssistant,
-      }),
-      currentAttemptCompletedAssistant: finalAssistant,
-      terminalState: {
-        outcome: {
-          reason: "hard_timeout",
-          status: "timeout",
-          timeoutPhase: "provider",
-          providerStarted: true,
+        terminalState: {
+          outcome: {
+            reason: "hard_timeout",
+            status: "timeout",
+            timeoutPhase: "provider",
+            providerStarted: true,
+          },
+          signalOwnedInterruption: false,
         },
-        signalOwnedInterruption: false,
-      },
-    });
+      });
 
-    expect(prepared.hasSuccessfulFinalAssistantAfterPromptTimeout).toBe(true);
-    expect(prepared.recoveredFinalAssistantPayloadsAfterPromptTimeout).toEqual([
-      expect.objectContaining({
-        mediaUrl: "https://example.test/recovered-output.png",
-        text: completedText,
-      }),
-      { text: finalText },
-    ]);
-  });
+      expect(prepared.hasSuccessfulFinalAssistantAfterPromptTimeout).toBe(true);
+      expect(prepared.recoveredFinalAssistantPayloadsAfterPromptTimeout).toEqual([
+        expect.objectContaining({
+          mediaUrl: "https://example.test/recovered-output.png",
+          text: completedText,
+        }),
+        { text: finalText },
+      ]);
+      const recoveredAnswer = prepared.recoveredFinalAssistantPayloadsAfterPromptTimeout?.[1];
+      assert(recoveredAnswer);
+      expect(getReplyPayloadMetadata(recoveredAnswer)?.assistantTranscriptSource).toEqual(
+        hasSource ? { occurrenceId: "final-response", messageId: "final-row" } : undefined,
+      );
+    },
+  );
 
   it("does not recover stale session text after the current prompt times out", async () => {
     const staleAssistant = {
