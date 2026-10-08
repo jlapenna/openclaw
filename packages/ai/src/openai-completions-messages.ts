@@ -117,8 +117,6 @@ export function convertMessages(
     }
 
     if (isRuntimeContextMessage(msg)) {
-      // Chat templates may allow system content only at index zero. Keep
-      // notices append-only, at developer authority when the route supports it.
       params.push({
         role: compat.supportsDeveloperRole ? "developer" : "user",
         content: sanitizeSurrogates(runtimeContextContentToText(msg.content)),
