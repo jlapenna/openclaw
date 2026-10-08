@@ -101,7 +101,12 @@ export async function resolveApprovedWorkerLocalModel(params: ResolveApprovedWor
       resolved.ref.model,
     );
     if (!model) {
-      return { error: `Unknown configured model: ${resolved.ref.provider}/${resolved.ref.model}` };
+      return {
+        error:
+          `Worker-local inference model ${resolved.ref.provider}/${resolved.ref.model} is missing ` +
+          "from the Gateway model catalog. Add its metadata under models.providers in the " +
+          "Gateway openclaw.json; keep its endpoint and credentials only on the node.",
+      };
     }
     return {
       transcriptPolicy: resolveTranscriptPolicy({
@@ -174,6 +179,8 @@ export async function resolveApprovedWorkerModel(params: ResolveApprovedWorkerMo
     // Route projection and credential selection are one decision. Pin even an
     // automatic profile so generic auth fallback cannot cross to another route.
     const prepared = await prepareSimpleCompletionModel({
+      // This session-bound worker owner revalidates the exact live turn after awaited work.
+      workerInferenceAuthority: { assertCurrent: params.assertCurrent },
       cfg: modelConfig,
       transport: "provider-stream",
       agentId: target.agentId,

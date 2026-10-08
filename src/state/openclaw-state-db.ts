@@ -1,6 +1,9 @@
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { withStateDatabaseColdAdmission } from "../infra/gateway-state-owner.js";
+import {
+  assertStateDatabaseAccessAllowed,
+  withStateDatabaseColdAdmission,
+} from "../infra/gateway-state-owner.js";
 import {
   normalizeSqliteNonNegativeInteger,
   runWithSqliteBusyTimeout,
@@ -263,8 +266,6 @@ export async function openExistingOpenClawStateDatabaseReadOnly(
   };
 }
 
-/** Open or return a cached shared state database after schema and migration checks. */
-
 function openOpenClawStateDatabaseWithBusyTimeout(
   options: OpenClawStateDatabaseOptions = {},
   busyTimeoutMs = OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
@@ -362,7 +363,6 @@ function openOpenClawStateDatabaseWithBusyTimeout(
   }
 }
 
-/** Open or return a cached shared state database after schema and migration checks. */
 export function openOpenClawStateDatabase(
   options: OpenClawStateDatabaseOptions = {},
 ): OpenClawStateDatabase {
@@ -462,20 +462,23 @@ export function runOpenClawStateWriteTransaction<T>(
   const existing = options.database ?? getOpenClawStateDatabaseIfOpen(options);
   if (existing) {
     isExistingOpenClawStateSchema(existing.path, existing.db);
+    if (options.database) {
+      assertStateDatabaseAccessAllowed(existing.path);
+    }
   }
   let database = existing;
   let callbackEntered = false;
   let committed: { database: OpenClawStateDatabase; value: T };
   const execute = (remaining?: () => number) => {
-    const acquired = options.database
-      ? openOpenClawStateDatabase(options)
-      : (database ??
-        openOpenClawStateDatabaseWithBusyTimeout(
-          options,
-          OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
-          "report",
-          remaining,
-        ));
+    // A supplied writer is already selected; its authoritative rows are read after BEGIN.
+    const acquired =
+      database ??
+      openOpenClawStateDatabaseWithBusyTimeout(
+        options,
+        OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
+        "report",
+        remaining,
+      );
     database = acquired;
     const value = runManagedStateTransaction(
       acquired.db,
@@ -492,6 +495,9 @@ export function runOpenClawStateWriteTransaction<T>(
           schemaReady: stateDbCache.isOpenClawStateDatabaseSchemaReady(acquired),
         });
         observeOpenClawDatabaseMaintenanceResource(acquired.db);
+        if (options.database) {
+          stateDbCache.touchStateDatabase(acquired);
+        }
         callbackEntered = true;
         return operation(acquired);
       },
