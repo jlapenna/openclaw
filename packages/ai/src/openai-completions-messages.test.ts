@@ -27,6 +27,64 @@ const model: Model<"openai-completions"> = {
 
 const emptyUsage = createZeroUsage();
 
+describe("convertMessages runtime notices", () => {
+  it.each([
+    { reasoning: false, supportsDeveloperRole: false, noticeRole: "user" },
+    { reasoning: true, supportsDeveloperRole: false, noticeRole: "user" },
+    { reasoning: false, supportsDeveloperRole: true, noticeRole: "developer" },
+    { reasoning: true, supportsDeveloperRole: true, noticeRole: "developer" },
+  ])(
+    "keeps notices in place without mid-transcript system messages ($reasoning, $supportsDeveloperRole)",
+    ({ reasoning, supportsDeveloperRole, noticeRole }) => {
+      const context: Context = {
+        systemPrompt: "Stable instructions",
+        messages: [
+          { role: "user", content: "previous question", timestamp: 1 },
+          {
+            role: "assistant",
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            content: [{ type: "text", text: "previous answer" }],
+            usage: emptyUsage,
+            stopReason: "stop",
+            timestamp: 2,
+          },
+          { role: "user", content: "heartbeat notice", runtimeContext: {}, timestamp: 3 },
+          {
+            role: "user",
+            content: [{ type: "text", text: "compaction notice" }],
+            runtimeContextCarrier: true,
+            timestamp: 4,
+          },
+          { role: "user", content: "current question", timestamp: 5 },
+        ],
+      };
+      const original = structuredClone(context);
+      const cacheOptOutIndexes = new Set<number>();
+      const converted = convertMessages(
+        { ...model, reasoning },
+        context,
+        { ...resolveOpenAICompletionsCompat(model), supportsDeveloperRole },
+        { cacheOptOutIndexes },
+      );
+      expect(converted).toEqual([
+        {
+          role: reasoning && supportsDeveloperRole ? "developer" : "system",
+          content: "Stable instructions",
+        },
+        { role: "user", content: "previous question" },
+        { role: "assistant", content: "previous answer" },
+        { role: noticeRole, content: "heartbeat notice" },
+        { role: noticeRole, content: "compaction notice" },
+        { role: "user", content: "current question" },
+      ]);
+      expect(cacheOptOutIndexes).toEqual(new Set([3, 4]));
+      expect(context).toEqual(original);
+    },
+  );
+});
+
 describe("convertMessages assistant text replay", () => {
   it("serializes advertised video in ordered Chat Completions user content", () => {
     const videoModel = {
@@ -633,7 +691,7 @@ describe("convertMessages relocatable region", () => {
           { type: "text", text: "Runtime facts" },
         ],
       },
-      { role: "system", content: "OpenClaw runtime context:\nlater context" },
+      { role: "developer", content: "OpenClaw runtime context:\nlater context" },
     ]);
     expect(cacheOptOutIndexes).toEqual(new Set([3, 4]));
   });
@@ -657,7 +715,7 @@ describe("convertMessages relocatable region", () => {
 
     expect(converted).toEqual([
       { role: "system", content: "Stable prefix" },
-      { role: "system", content: "legacy plugin runtime context" },
+      { role: "developer", content: "legacy plugin runtime context" },
     ]);
     expect(cacheOptOutIndexes).toEqual(new Set([1]));
   });
