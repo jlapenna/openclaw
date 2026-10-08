@@ -20,6 +20,7 @@ import {
   resetCompactHooksHarnessMocks,
   resolveContextEngineMock,
   resolveModelMock,
+  triggerInternalHookMock,
 } from "./compact.hooks.harness.js";
 
 const { requestPreparedCompaction } = vi.hoisted(() => ({
@@ -41,6 +42,7 @@ let databases: typeof import("../../state/openclaw-agent-db.js");
 let streamResolution: typeof import("./stream-resolution.js");
 let replay: typeof import("../openai-transport-stream.test-support.js").testing;
 let accounting: typeof import("./run/compaction-accounting-bridge.js");
+let compactionHooks: typeof import("./compaction-hooks.js");
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
     await databases.closeOpenClawAgentDatabasesAsync();
@@ -73,6 +75,7 @@ beforeAll(async () => {
     streamResolution,
     { testing: replay },
     accounting,
+    compactionHooks,
   ] = await Promise.all([
     import("../../context-engine/delegate.js"),
     import("../sessions/index.js"),
@@ -81,6 +84,7 @@ beforeAll(async () => {
     import("./stream-resolution.js"),
     import("../openai-transport-stream.test-support.js"),
     import("./run/compaction-accounting-bridge.js"),
+    import("./compaction-hooks.js"),
   ]);
 });
 
@@ -196,6 +200,134 @@ async function createFixture(operation: "summary" | "endpoint", globalAlias = fa
 }
 
 describe("direct compactor through the context-engine delegate", () => {
+  it.each([
+    { limit: "at-boundary", enabled: true, explicit: undefined, expected: "transcript_bytes" },
+    { limit: "above-boundary", enabled: true, explicit: undefined, expected: undefined },
+    { limit: "zero", enabled: true, explicit: undefined, expected: undefined },
+    { limit: "at-boundary", enabled: false, explicit: undefined, expected: undefined },
+    { limit: "at-boundary", enabled: true, explicit: "tokens", expected: "tokens" },
+    {
+      limit: "at-boundary",
+      enabled: true,
+      explicit: "transcript_bytes",
+      expected: "transcript_bytes",
+    },
+  ] as const)(
+    "passes honest manual byte pressure (limit=$limit, enabled=$enabled, explicit=$explicit)",
+    async ({ limit, enabled, explicit, expected }) => {
+      const fixture = await createFixture("summary");
+      const { readSessionTranscriptAccountingAsync } =
+        await import("../../gateway/session-transcript-readers.js");
+      const snapshot = await readSessionTranscriptAccountingAsync(fixture.target, {
+        includeByteSize: true,
+        includeUsage: false,
+      });
+      expect(snapshot.byteSize).toBeGreaterThan(0);
+      if (snapshot.byteSize === undefined) {
+        throw new Error("Fixture must have measured active transcript bytes");
+      }
+      const maxActiveTranscriptBytes =
+        limit === "zero" ? 0 : `${snapshot.byteSize + (limit === "above-boundary" ? 1 : 0)}b`;
+      const backend = vi.fn<ContextEngine["compact"]>(async () => ({
+        ok: true,
+        compacted: false,
+      }));
+      resolveContextEngineMock.mockResolvedValueOnce({
+        info: { ownsCompaction: true },
+        compact: backend,
+      });
+      const result = await compactQueued({
+        ...fixture.target,
+        sessionTarget: fixture.target,
+        sessionFile: fixture.target.sessionKey,
+        workspaceDir,
+        config: {
+          ...fixture.runtimeContext.config,
+          agents: {
+            ...fixture.runtimeContext.config.agents,
+            defaults: { compaction: { enabled, maxActiveTranscriptBytes } },
+          },
+        },
+        provider: model.provider,
+        model: model.id,
+        agentHarnessId: "openclaw",
+        trigger: "manual",
+        preflightCompactionTrigger: explicit,
+        enqueue: async (task) => await task(),
+      });
+      expect(result).toMatchObject({ ok: true, compacted: false });
+      expect(backend).toHaveBeenCalledOnce();
+      expect(backend.mock.calls[0]?.[0].runtimeContext).toMatchObject({
+        trigger: "manual",
+        preflightCompactionTrigger: expected,
+      });
+      expect(sessions.SessionManager.open(fixture.target).getEntries()).toEqual(
+        fixture.originalEntries,
+      );
+    },
+  );
+
+  it.each([
+    { operation: "summary", ownsCompaction: false },
+    { operation: "endpoint", ownsCompaction: false },
+    { operation: "summary", ownsCompaction: true },
+    { operation: "endpoint", ownsCompaction: true },
+  ] as const)(
+    "runs one queued delegated $operation lifecycle (ownsCompaction=$ownsCompaction)",
+    async ({ operation, ownsCompaction }) => {
+      const fixture = await createFixture(operation);
+      const backend = vi.fn<ContextEngine["compact"]>(delegate);
+      resolveContextEngineMock.mockResolvedValueOnce({
+        info: { ownsCompaction },
+        compact: backend,
+      });
+      const effects = vi.spyOn(compactionHooks, "runPostCompactionSideEffects");
+      try {
+        const result = await compactQueued({
+          ...fixture.target,
+          sessionTarget: fixture.target,
+          sessionFile: fixture.target.sessionKey,
+          workspaceDir,
+          config: fixture.runtimeContext.config,
+          provider: model.provider,
+          model: model.id,
+          agentHarnessId: "openclaw",
+          trigger: "manual",
+          enqueue: async (task) => await task(),
+        });
+        expect(result, JSON.stringify(result)).toMatchObject({ ok: true, compacted: true });
+        expect(backend).toHaveBeenCalledOnce();
+        expect.soft(hookRunner.runBeforeCompaction).toHaveBeenCalledOnce();
+        expect.soft(hookRunner.runAfterCompaction).toHaveBeenCalledOnce();
+        expect.soft(effects).toHaveBeenCalledOnce();
+        // Native session events still carry real transcript metrics even when
+        // the queued host owns plugin callbacks and post-compaction refresh.
+        expect(triggerInternalHookMock.mock.calls.map(([event]) => event)).toEqual([
+          expect.objectContaining({ action: "compact:before" }),
+          expect.objectContaining({ action: "compact:after" }),
+        ]);
+        const manager = sessions.SessionManager.open(fixture.target);
+        if (operation === "summary") {
+          expect(manager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(
+            1,
+          );
+          for (const entry of fixture.originalEntries) {
+            expect(manager.getEntries()).toContainEqual(entry);
+          }
+        } else {
+          expect(manager.buildSessionContext().messages.at(-1)).toMatchObject({
+            providerReplay: { data: "opaque-fixture", compactedWindow: { state: "ready" } },
+          });
+        }
+        expect(sessions.SessionManager.open(fixture.decoy).buildSessionContext().messages).toEqual([
+          { role: "user", content: "Unrelated store history", timestamp: 1 },
+        ]);
+      } finally {
+        effects.mockRestore();
+      }
+    },
+  );
+
   it.each([
     { operation: "summary", partial: true, threadId: 0 },
     { operation: "endpoint", partial: false, threadId: 0 },
@@ -459,15 +591,20 @@ describe("direct compactor through the context-engine delegate", () => {
     ]);
   });
 
-  it.each(["summary", "endpoint"] as const)(
-    "keeps queued manual %s compaction countable when cancellation follows its commit during a post-compaction hook",
-    async (operation) => {
+  it.each([
+    { operation: "summary", ownsCompaction: false },
+    { operation: "endpoint", ownsCompaction: false },
+    { operation: "summary", ownsCompaction: true },
+    { operation: "endpoint", ownsCompaction: true },
+  ] as const)(
+    "keeps queued manual $operation compaction countable when cancellation follows its commit during a post-compaction hook (ownsCompaction=$ownsCompaction)",
+    async ({ operation, ownsCompaction }) => {
       const fixture = await createFixture(operation);
       const { incrementCompactionCount } =
         await import("../../auto-reply/reply/session-updates.js");
       const backend = vi.fn<ContextEngine["compact"]>(delegate);
       resolveContextEngineMock.mockResolvedValueOnce({
-        info: { ownsCompaction: false },
+        info: { ownsCompaction },
         compact: backend,
       });
       const expectedSession = accessor.loadSessionEntry(fixture.target);
