@@ -569,15 +569,20 @@ export function createChatSendReplyDispatch(params: {
   };
   const finalizeAgentMediaTranscript = async () => {
     const latestPayloadByKey = new Map<string, ReplyDispatchOperation>();
+    const latestPayloadByOccurrence = new Map<string, ReplyDispatchOperation>();
     for (const { input } of deliveredReplies) {
       const payload = readChatSendReplyPayload(input);
       if (!needsAgentMediaTranscriptFinalization(payload)) {
         continue;
       }
       const key = agentMediaTranscriptKey(payload);
-      // A repeated index replaces its prior payload, but stays in delivery order.
-      latestPayloadByKey.delete(key);
+      // Replacements retain first-seen materialization order. Aggregate selection
+      // separately follows actual delivery, even when it reuses an earlier index.
       latestPayloadByKey.set(key, input);
+      const source = getReplyPayloadMetadata(payload)?.assistantTranscriptSource;
+      if (source && key.startsWith("source:")) {
+        latestPayloadByOccurrence.set(source.occurrenceId, input);
+      }
     }
     const byOccurrence = new Map<string, ReplyDispatchOperation[]>();
     for (const [key, input] of latestPayloadByKey) {
@@ -600,8 +605,8 @@ export function createChatSendReplyDispatch(params: {
       (getReplyPayloadMetadata(payload)?.assistantMediaFailures ?? []).map((failure) =>
         JSON.stringify([failure.code, failure.kind, failure.label, failure.mimeType ?? null]),
       );
-    for (const group of byOccurrence.values()) {
-      const latest = group.at(-1);
+    for (const [occurrenceId, group] of byOccurrence) {
+      const latest = latestPayloadByOccurrence.get(occurrenceId);
       if (!latest || group.length < 2) {
         continue;
       }
@@ -611,7 +616,7 @@ export function createChatSendReplyDispatch(params: {
       }
       const coveredUrls = new Set(payloadMediaUrls(latestPayload));
       const coveredFailures = failureKeys(latestPayload);
-      const preceding = group.slice(0, -1);
+      const preceding = group.filter((input) => input !== latest);
       const requiredFailures = preceding.flatMap((input) =>
         failureKeys(readChatSendReplyPayload(input)),
       );

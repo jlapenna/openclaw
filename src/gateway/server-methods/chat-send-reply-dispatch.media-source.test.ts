@@ -109,8 +109,10 @@ it.each([
   "identical-url-unwind",
   "repeated-index",
   "completed-aggregate",
+  "completed-aggregate-first-index",
 ] as const)("retains delivered media within one assistant occurrence (%s)", async (scenario) => {
   await withOpenClawTestState({ label: "chat-media-content-index" }, async (state) => {
+    const isCompletedAggregate = scenario.startsWith("completed-aggregate");
     const { scope, runId, append, dispatch } = await createReplyTranscriptFixture();
     await fs.mkdir(state.statePath("media"), { recursive: true });
     const mediaUrls = [
@@ -137,7 +139,7 @@ it.each([
       expect(
         dispatch.captureAgentTranscriptStart(runId, manager[sessionManagerReadTranscriptStart]()),
       ).toBe(true);
-      if (scenario === "committed-unwind" || scenario === "completed-aggregate") {
+      if (scenario === "committed-unwind" || isCompletedAggregate) {
         await append("canonical-response", canonical);
         source.messageId = "canonical-response";
       }
@@ -153,12 +155,12 @@ it.each([
           ),
         );
       }
-      if (scenario === "completed-aggregate") {
+      if (isCompletedAggregate) {
         dispatcher.sendFinalReply(
           setReplyPayloadMetadata(
             { mediaUrls },
             {
-              assistantMessageIndex: 2,
+              assistantMessageIndex: scenario === "completed-aggregate-first-index" ? 1 : 2,
               assistantTranscriptSource: source,
               assistantTranscriptMediaUrls: mediaUrls,
               assistantTranscriptAggregate: true,
@@ -195,7 +197,7 @@ it.each([
     if (scenario !== "repeated-index" && scenario !== "identical-url-unwind") {
       expect(new Set(imageBlocks.map((block) => JSON.stringify(block))).size).toBe(2);
     }
-    if (scenario === "completed-aggregate") {
+    if (isCompletedAggregate) {
       expect(messages).toHaveLength(1);
     }
     if (source.messageId) {
