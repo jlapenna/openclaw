@@ -308,10 +308,12 @@ export function createChatSendReplyDispatch(params: {
     if (ownedIdempotencyKey) {
       return `owned:${ownedIdempotencyKey}`;
     }
+    const contentIndex = metadata?.assistantMessageIndex;
     if (metadata?.assistantTranscriptSource) {
-      return `source:${metadata.assistantTranscriptSource.occurrenceId}`;
+      const sourceKey = `source:${metadata.assistantTranscriptSource.occurrenceId}`;
+      return contentIndex === undefined ? sourceKey : `${sourceKey}:index:${contentIndex}`;
     }
-    return "unkeyed";
+    return contentIndex === undefined ? "unkeyed" : `index:${contentIndex}`;
   };
   const appendWebchatAgentMediaTranscriptIfNeeded = async (input: ReplyDispatchOperation) => {
     const payload = readChatSendReplyPayload(input);
@@ -509,8 +511,8 @@ export function createChatSendReplyDispatch(params: {
       // Even a hook-suppressed append retains its own occurrence. Never invent
       // row identity from a stream index, or repeat provider text in a supplement.
       idempotencyKey: assistantSource
-        ? `${clientRunId}:assistant-media:${assistantSource.occurrenceId}`
-        : `${clientRunId}:assistant-media`,
+        ? `${clientRunId}:assistant-media:${assistantSource.occurrenceId}${assistantMessageIndex === undefined ? "" : `:index:${assistantMessageIndex}`}`
+        : `${clientRunId}:assistant-media${assistantMessageIndex === undefined ? "" : `:${assistantMessageIndex}`}`,
       ttsSupplement: ttsSupplementMarker,
       config: cfg,
       onMessageCommitted: (receipt, acceptCompletion) => {
@@ -595,12 +597,79 @@ export function createChatSendReplyDispatch(params: {
   };
   const finalizeAgentMediaTranscript = async () => {
     const latestPayloadByKey = new Map<string, ReplyDispatchOperation>();
+    const latestPayloadByOccurrence = new Map<string, ReplyDispatchOperation>();
     for (const { input } of deliveredReplies) {
       const payload = readChatSendReplyPayload(input);
       if (!needsAgentMediaTranscriptFinalization(payload)) {
         continue;
       }
-      latestPayloadByKey.set(agentMediaTranscriptKey(payload), input);
+      const key = agentMediaTranscriptKey(payload);
+      // Replacements retain first-seen materialization order. Aggregate selection
+      // separately follows actual delivery, even when it reuses an earlier index.
+      latestPayloadByKey.set(key, input);
+      const source = getReplyPayloadMetadata(payload)?.assistantTranscriptSource;
+      if (source && key.startsWith("source:")) {
+        latestPayloadByOccurrence.set(source.occurrenceId, input);
+      }
+    }
+    const byOccurrence = new Map<string, ReplyDispatchOperation[]>();
+    for (const [key, input] of latestPayloadByKey) {
+      const source = getReplyPayloadMetadata(
+        readChatSendReplyPayload(input),
+      )?.assistantTranscriptSource;
+      if (!source || !key.startsWith("source:")) {
+        continue;
+      }
+      const group = byOccurrence.get(source.occurrenceId) ?? [];
+      group.push(input);
+      byOccurrence.set(source.occurrenceId, group);
+    }
+    const payloadMediaUrls = (payload: ReplyPayload) =>
+      uniqueStrings([
+        ...(payload.mediaUrls ?? []),
+        ...(payload.mediaUrl ? [payload.mediaUrl] : []),
+      ]);
+    const failureKeys = (payload: ReplyPayload) =>
+      (getReplyPayloadMetadata(payload)?.assistantMediaFailures ?? []).map((failure) =>
+        JSON.stringify([failure.code, failure.kind, failure.label, failure.mimeType ?? null]),
+      );
+    for (const [occurrenceId, group] of byOccurrence) {
+      const latest = latestPayloadByOccurrence.get(occurrenceId);
+      if (!latest || group.length < 2) {
+        continue;
+      }
+      const latestPayload = readChatSendReplyPayload(latest);
+      if (getReplyPayloadMetadata(latestPayload)?.assistantTranscriptAggregate !== true) {
+        continue;
+      }
+      const coveredUrls = new Set(payloadMediaUrls(latestPayload));
+      const coveredFailures = failureKeys(latestPayload);
+      const preceding = group.filter((input) => input !== latest);
+      const requiredFailures = preceding.flatMap((input) =>
+        failureKeys(readChatSendReplyPayload(input)),
+      );
+      const coversFailures = requiredFailures.every((failure) => {
+        const index = coveredFailures.indexOf(failure);
+        if (index < 0) {
+          return false;
+        }
+        coveredFailures.splice(index, 1);
+        return true;
+      });
+      // A committed receipt does not prove message_end's aggregate was delivered.
+      // Coalesce only producer-owned aggregates with actual coverage; partial/error
+      // unwind keeps each content index, including identical URLs or failure cards.
+      if (
+        !coversFailures ||
+        !preceding.every((input) =>
+          payloadMediaUrls(readChatSendReplyPayload(input)).every((url) => coveredUrls.has(url)),
+        )
+      ) {
+        continue;
+      }
+      for (const input of preceding) {
+        latestPayloadByKey.delete(agentMediaTranscriptKey(readChatSendReplyPayload(input)));
+      }
     }
     for (const input of latestPayloadByKey.values()) {
       try {

@@ -500,6 +500,7 @@ describe("prepareEmbeddedRunTerminal", () => {
               occurrenceId: "partial-response",
               messageId: "partial-row",
             },
+            assistantTranscriptAggregate: true,
           },
         ),
       ]);
@@ -546,6 +547,9 @@ describe("prepareEmbeddedRunTerminal", () => {
       expect(getReplyPayloadMetadata(recoveredAnswer)?.assistantTranscriptSource).toEqual(
         hasSource ? { occurrenceId: "final-response", messageId: "final-row" } : undefined,
       );
+      expect(
+        getReplyPayloadMetadata(recoveredAnswer)?.assistantTranscriptAggregate,
+      ).toBeUndefined();
     },
   );
 

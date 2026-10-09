@@ -8,7 +8,7 @@ import { createFixtureLifetime } from "../../../test/helpers/fixture-lifetime.js
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createEmbeddedAttemptTranscriptLifecycle } from "../../agents/embedded-agent-runner/run/attempt-transcript-lifecycle.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
-import type { AssistantTranscriptSource } from "../../agents/sessions/agent-session-types.js";
+import type { AssistantTranscriptSource } from "../../agents/sessions/assistant-transcript-source.js";
 import { buildAssistantMessage, buildUsageWithNoCost } from "../../agents/stream-message-shared.js";
 import { setReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";

@@ -47,7 +47,7 @@ import {
 } from "../../embedded-agent-utils.js";
 import { isTimeoutErrorMessage } from "../../failover/classify.js";
 import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
-import type { AssistantTranscriptSource } from "../../sessions/agent-session-types.js";
+import type { AssistantTranscriptSource } from "../../sessions/assistant-transcript-source.js";
 import type { ToolErrorSummary } from "../../tool-error-summary.js";
 import {
   hasCompletedMessagingToolDeliveryEvidence,
@@ -354,7 +354,10 @@ export function buildEmbeddedRunPayloads(params: {
         // A fallback can combine text from several physical responses. Without
         // per-text custody, the latest answer's receipt must not own all of them.
         if (answerSource && answerTexts.length === 1) {
-          setReplyPayloadMetadata(replyPayload, { assistantTranscriptSource: answerSource });
+          setReplyPayloadMetadata(replyPayload, {
+            assistantTranscriptSource: answerSource,
+            ...(shouldUseCanonicalFinalAnswer ? { assistantTranscriptAggregate: true } : {}),
+          });
         }
         replyItems.push(
           ttsFacts ? setReplyPayloadMetadata(replyPayload, { tts: ttsFacts }) : replyPayload,

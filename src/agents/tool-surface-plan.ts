@@ -6,6 +6,7 @@ import {
   isCodeModeEngagedForModel,
   resolveCodeModeConfig,
 } from "./code-mode.js";
+import type { EmbeddedRunTrigger } from "./run-trigger.js";
 import { normalizeToolPolicyName, readToolAllowlistIntersection } from "./tool-policy-shared.js";
 import { resolveAgentToolSearchRuntimeConfig } from "./tool-search-runtime-config.js";
 import type { ToolSearchConfig } from "./tool-search-types.js";
@@ -30,6 +31,7 @@ export type AgentToolSurfacePlanParams = {
   isRawModelRun: boolean;
   toolsAllow?: readonly string[];
   forceCodeModeControls?: boolean;
+  trigger?: EmbeddedRunTrigger;
 };
 
 export function resolveAgentToolSurfacePlan(params: AgentToolSurfacePlanParams) {
@@ -60,12 +62,20 @@ export function resolveAgentToolSurfacePlan(params: AgentToolSurfacePlanParams) 
   });
   // Apply invocation restrictions after selecting the current runtime snapshot;
   // config rebinding must not put an auxiliary direct-tool run back behind discovery.
-  const toolSearchRuntimeConfig = params.disableToolSearch
-    ? { ...selectedToolConfig, tools: { ...selectedToolConfig?.tools, toolSearch: false as const } }
-    : selectedToolConfig;
+  // Memory persistence has already been projected onto its owning writer. Do
+  // not replace that surface with discovery or a general execution control.
+  const isMemoryFlushRun = params.trigger === "memory";
+  const toolSearchRuntimeConfig =
+    params.disableToolSearch || isMemoryFlushRun
+      ? {
+          ...selectedToolConfig,
+          tools: { ...selectedToolConfig?.tools, toolSearch: false as const },
+        }
+      : selectedToolConfig;
   const toolSearchConfig = resolveToolSearchConfig(toolSearchRuntimeConfig);
   const toolsAvailable =
     params.toolsEnabled &&
+    !isMemoryFlushRun &&
     getActiveAgentRingZeroTools().length === 0 &&
     params.disableTools !== true &&
     !params.isRawModelRun &&

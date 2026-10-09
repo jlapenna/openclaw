@@ -9,7 +9,7 @@ import {
   streamMocks,
   testModel,
 } from "./agent-session-loop-correctness.test-support.js";
-import type { AssistantTranscriptSource } from "./agent-session-types.js";
+import type { AssistantTranscriptSource } from "./assistant-transcript-source.js";
 
 registerAgentSessionLoopTestLifecycle();
 
@@ -66,6 +66,11 @@ it("binds delivered blocks to their own committed assistant occurrence without d
         .filter((reply) => reply.mediaUrls?.length)
         .map((reply) => getReplyPayloadMetadata(reply)?.assistantTranscriptSource),
     ).toEqual(sources);
+    expect(
+      replies
+        .filter((reply) => reply.mediaUrls?.length)
+        .map((reply) => getReplyPayloadMetadata(reply)?.assistantTranscriptAggregate),
+    ).toEqual([true, true]);
     expect(subscription.getLastAssistantTranscriptSource()).toBe(sources[1]);
     for (const source of sources) {
       expect(JSON.stringify(entries)).not.toContain(source.occurrenceId);

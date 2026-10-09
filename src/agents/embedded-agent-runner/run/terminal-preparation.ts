@@ -11,7 +11,7 @@ import type { AuthProfileStore } from "../../auth-profiles.js";
 import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
 import { isProviderModelRerouted } from "../../provider-model-route.js";
 import type { ReplyDeliveryState } from "../../reply-completion.js";
-import type { AssistantTranscriptSource } from "../../sessions/agent-session-types.js";
+import type { AssistantTranscriptSource } from "../../sessions/assistant-transcript-source.js";
 import { getCoreTtsAttemptResultMediaUrls } from "../../tools/tts-tool-result-provenance.js";
 import type { NormalizedUsage } from "../../usage.js";
 import {
@@ -351,7 +351,10 @@ function replacePartialAssistantPayload(input: {
     }),
     // Recovery replaces the text's source, not just its display. Missing custody
     // cannot inherit the partial payload's unrelated occurrence.
-    { assistantTranscriptSource: input.assistantTranscriptSource },
+    {
+      assistantTranscriptSource: input.assistantTranscriptSource,
+      assistantTranscriptAggregate: undefined,
+    },
   );
   return payloads;
 }

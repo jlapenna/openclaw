@@ -79,6 +79,7 @@ export async function prepareEmbeddedAttemptBundleTools(params: {
   );
   const providedClientTools =
     toolsEnabled &&
+    params.attempt.trigger !== "memory" &&
     !params.attempt.disableTools &&
     !params.isRawModelRun &&
     !params.attempt.forceRestartSafeTools
@@ -107,6 +108,7 @@ export async function prepareEmbeddedAttemptBundleTools(params: {
     toolDenylist: runtimeCapabilityProfile.policy.explicitToolDenylist,
   };
   const bundleMcpEnabled =
+    params.attempt.trigger !== "memory" &&
     !params.attempt.forceRestartSafeTools &&
     shouldCreateBundleMcpRuntimeForAttempt({
       toolsEnabled,
@@ -158,6 +160,7 @@ export async function prepareEmbeddedAttemptBundleTools(params: {
   let bundleLspRuntime: Awaited<ReturnType<typeof createBundleLspToolRuntime>> | undefined;
   try {
     const bundleLspEnabled =
+      params.attempt.trigger !== "memory" &&
       !params.attempt.forceRestartSafeTools &&
       shouldCreateBundleLspRuntimeForAttempt({
         toolsEnabled,
