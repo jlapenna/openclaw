@@ -70,6 +70,11 @@ suite.define(() => {
       await page.goto(`${suite.server.baseUrl}chat`);
       await gateway.waitForRequest("chat.startup");
       await page.locator(".chat-bubble", { hasText: "Main transcript" }).first().waitFor();
+      await page
+        .locator(
+          `.sidebar-recent-session[data-session-key="${WARM_SESSION_KEY}"] a.sidebar-recent-session__link`,
+        )
+        .hover();
       await expect.poll(() => historyRequestCount(gateway, WARM_SESSION_KEY)).toBe(1);
       // A failed warm-up leaves the session eligible and arms the prefetcher's own
       // cooldown retry timer, which fires without any page update in between.

@@ -44,6 +44,10 @@ suite.define(() => {
     try {
       await page.goto(controlUiSessionUrl(suite.server.baseUrl, workKey));
       await page.locator(".chat-thread-inner").getByText("Workspace ready.").waitFor();
+      const reportLink = page
+        .locator(`openclaw-app-sidebar [data-session-key="${reportKey}"] a`)
+        .first();
+      await reportLink.hover();
       const reportRequests = async () =>
         (await gateway.getRequests("chat.history")).filter(
           (request) => (request.params as { sessionKey?: string }).sessionKey === reportKey,
@@ -77,10 +81,7 @@ suite.define(() => {
       });
       await gateway.deferNext("chat.history", { sessionKey: reportKey });
       await gateway.deferNext("chat.startup", { sessionKey: reportKey });
-      await page
-        .locator(`openclaw-app-sidebar [data-session-key="${reportKey}"] a`)
-        .first()
-        .click();
+      await reportLink.click();
       try {
         await page.locator(".chat-thread-inner").getByText(reportText).waitFor();
       } finally {
