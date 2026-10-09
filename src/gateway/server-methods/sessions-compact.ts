@@ -41,6 +41,7 @@ import { getWorkerInferenceSessionControl } from "../worker-environments/inferen
 import { resolveVisibleActiveSessionRunState } from "./session-active-runs.js";
 import { emitSessionsChanged } from "./session-change-event.js";
 import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
+import { waitForTerminalSessionRunSettlement } from "./session-run-settlement.js";
 import {
   preflightGatewaySessionCompaction,
   runGatewaySessionCompaction,
@@ -188,6 +189,16 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
       const lifecycleIdentities = [...queueIdentities, lifecycleRevision];
       let admissionError: ReturnType<typeof errorShape> | undefined;
       let compactionNoopReason: string | undefined;
+      const terminalSettled = await waitForTerminalSessionRunSettlement({
+        context,
+        storePath,
+        requestedKey: key,
+        canonicalKey: target.canonicalKey,
+        sessionId,
+        agentId: requestedAgentId,
+        defaultAgentId: compatibilityDefaultAgentId,
+        signal: abortSignal,
+      });
       await runExclusiveSessionLifecycleMutation("compact", {
         scope: storePath,
         identities: lifecycleIdentities,
@@ -217,6 +228,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
             }
           }
           const blockedByActiveRun =
+            !terminalSettled ||
             isCompetingSessionWorkAdmissionActive(storePath, lifecycleIdentities) ||
             (getWorkerInferenceSessionControl(context.workerEnvironmentService)?.hasSession(
               sessionId,
@@ -256,6 +268,13 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
             return;
           }
           const operationId = randomUUID();
+          const emitCompacted = (compacted: boolean) =>
+            emitSessionsChanged(context, {
+              sessionKey: target.canonicalKey,
+              agentId: target.agentId,
+              reason: "compact",
+              compacted,
+            });
           if (maxLines !== undefined) {
             const trimResult = await trimSessionTranscriptForManualCompact(transcriptScope, {
               maxLines,
@@ -293,12 +312,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
               undefined,
             );
             if (trimResult.compacted) {
-              emitSessionsChanged(context, {
-                sessionKey: target.canonicalKey,
-                agentId: target.agentId,
-                reason: "compact",
-                compacted: true,
-              });
+              emitCompacted(true);
             }
             return;
           }
@@ -429,12 +443,7 @@ export const sessionCompactHandlers: GatewayRequestHandlers = {
             undefined,
           );
           if (result.ok) {
-            emitSessionsChanged(context, {
-              sessionKey: target.canonicalKey,
-              agentId: target.agentId,
-              reason: "compact",
-              compacted: result.compacted,
-            });
+            emitCompacted(result.compacted);
           }
         },
       });
