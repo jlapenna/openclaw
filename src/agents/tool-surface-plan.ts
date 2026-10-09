@@ -60,10 +60,8 @@ export function resolveAgentToolSurfacePlan(params: AgentToolSurfacePlanParams) 
     completionPrivateMessageOnly,
     model: params.model,
   });
-  // Apply invocation restrictions after selecting the current runtime snapshot;
-  // config rebinding must not put an auxiliary direct-tool run back behind discovery.
-  // Memory persistence has already been projected onto its owning writer. Do
-  // not replace that surface with discovery or a general execution control.
+  // Apply restrictions after snapshot selection so config rebinding cannot
+  // restore discovery for direct-tool or persistence-only turns.
   const isMemoryFlushRun = params.trigger === "memory";
   const toolSearchRuntimeConfig =
     params.disableToolSearch || isMemoryFlushRun
@@ -131,20 +129,14 @@ export function applyAgentToolSurfaceCatalog({
   // When the message tool is the only reply path it must stay directly visible
   // in every search mode; a hidden delivery tool can leave the run mute.
   const directToolNames = forceDirectMessageTool ? ["message"] : [];
-  if (codeModeControlsEnabled) {
-    return applyCodeModeCatalog({
-      ...catalogParams,
-      config: catalogParams.config,
-      directToolNames,
-    });
-  }
-  const applyCatalog =
-    toolSearchConfig.mode === "directory"
+  const applyCatalog = codeModeControlsEnabled
+    ? applyCodeModeCatalog
+    : toolSearchConfig.mode === "directory"
       ? applyToolSchemaDirectoryCatalog
       : applyToolSearchCatalog;
   return applyCatalog({
     ...catalogParams,
-    config: toolSearchRuntimeConfig,
+    config: codeModeControlsEnabled ? catalogParams.config : toolSearchRuntimeConfig,
     directToolNames,
   });
 }
