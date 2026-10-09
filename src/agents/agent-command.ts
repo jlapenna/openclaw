@@ -64,7 +64,6 @@ import type {
 } from "./command/types.js";
 import { createInternalSessionEffectsCleanup } from "./internal-session-effects.js";
 import type { MainSessionRecoveryPendingTarget } from "./main-session-recovery/main-session-recovery-store.js";
-import { createAgentRunRestartAbortError, isAgentRunDirectAbortReason } from "./run-termination.js";
 import { withAgentPluginRegistry } from "./runtime-plugins.js";
 import { beginForegroundSessionMaintenance } from "./session-maintenance/coordinator.js";
 import {
@@ -100,34 +99,23 @@ async function agentCommandInternal(
       ? AbortSignal.any([preparedOpts.abortSignal, lifecycleAbortController.signal])
       : lifecycleAbortController.signal,
   };
+  const preparedContext = { ...prepared };
   const {
-    body,
-    transcriptBody,
     cfg,
-    configuredThinkingCatalog,
     agentCfg,
-    thinkOverride,
-    thinkOnce,
-    verboseOverride,
     sessionId,
     sessionKey,
     sessionStore,
     storePath,
     isNewSession,
-    persistedThinking,
-    persistedVerbose,
     sessionAgentId,
-    outboundSession,
     workspaceDir,
     cwd,
     runId,
     isSubagentLane,
-    acpManager,
     acpResolution,
-    pluginsEnabled,
     manifestMetadataSnapshot,
-    modelManifestContext,
-  } = prepared;
+  } = preparedContext;
   const isIncognito =
     prepared.sessionEntry?.incognito === true || isIncognitoSessionKey(sessionKey);
   // Provider and persistence errors can include temporary conversation content.
@@ -196,10 +184,7 @@ async function agentCommandInternal(
       scope: storePath ?? `agent:${sessionAgentId}`,
       identities: [sessionKey, sessionId],
       signal: opts.abortSignal,
-      onInterrupt: (reason) =>
-        lifecycleAbortController.abort(
-          isAgentRunDirectAbortReason(reason) ? reason : createAgentRunRestartAbortError(),
-        ),
+      onInterrupt: (reason) => lifecycleAbortController.abort(reason),
       assertAllowed: () => {
         const currentEntry =
           sessionStoreRuntime && storePath && sessionKey
@@ -400,25 +385,15 @@ async function agentCommandInternal(
           lifecycleGeneration,
         });
         return await runAcpAgentCommand({
-          cfg,
+          ...preparedContext,
           deps: resolvedDeps,
           runtime,
           opts,
-          outboundSession,
           sessionEntry,
-          sessionStore,
-          body,
-          transcriptBody,
           suppressVisibleSessionEffects,
           provenance: isSubagentLane ? "agent" : sessionStateActor.actorType,
-          sessionAgentId,
-          sessionId,
           sessionKey,
-          storePath,
-          workspaceDir,
-          runId,
           lifecycleGeneration,
-          acpManager,
           acpResolution,
           trackInternalModelRunTarget,
           preparedRunAdmission,
@@ -429,26 +404,14 @@ async function agentCommandInternal(
         "session-state",
         () =>
           prepareEmbeddedSessionState({
-            cfg,
+            ...preparedContext,
             opts,
             sessionEntry,
-            sessionStore,
-            sessionKey,
-            sessionId,
-            storePath,
-            sessionAgentId,
             lifecycleGeneration,
-            runId,
             executionWorkspaceDir: cwd ?? workspaceDir,
             watchSkills,
-            isNewSession,
             isSubagentLaneTurn: isSubagentLane,
             suppressVisibleSessionEffects,
-            thinkOnce,
-            thinkOverride,
-            persistedThinking,
-            verboseOverride,
-            persistedVerbose,
             verboseDefault: agentCfg?.verboseDefault as VerboseLevel | undefined,
             sessionStateActor,
             ...(manifestMetadataSnapshot
@@ -464,23 +427,10 @@ async function agentCommandInternal(
         "model-selection",
         () =>
           resolveEmbeddedModelSelection({
-            cfg,
+            ...preparedContext,
             opts,
             sessionEntry,
-            sessionStore,
-            sessionKey,
-            sessionId,
-            storePath,
-            sessionAgentId,
-            workspaceDir,
-            pluginsEnabled,
-            manifestMetadataSnapshot,
-            modelManifestContext,
-            configuredThinkingCatalog,
             requestedThinkLevel,
-            thinkOverride,
-            thinkOnce,
-            isSubagentLane,
             suppressVisibleSessionEffects,
             runContext,
           }),
