@@ -85,8 +85,9 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
       assistantMessageIndex: 1,
       assistantTranscriptSource: { occurrenceId: "image-response", messageId: "image-row" },
     });
-
     expect(payloads).toHaveLength(1);
+    assert(payloads[0]);
+    expect(getReplyPayloadMetadata(payloads[0])?.assistantTranscriptAggregate).toBeUndefined();
     expect(payloads[0]?.text).toBe("Attached image");
     expect(payloads[0]?.mediaUrl).toBe("/tmp/reply-image.png");
     expect(payloads[0]?.mediaUrls).toEqual(["/tmp/reply-image.png"]);
@@ -302,6 +303,9 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
       expect(payloads[0]?.mediaUrl).toBe("/tmp/kept.png");
       expect(getReplyPayloadMetadata(payloads[0])?.assistantTranscriptSource).toEqual(
         hasSource ? { occurrenceId: "kept-response", messageId: "kept-row" } : undefined,
+      );
+      expect(getReplyPayloadMetadata(payloads[0])?.assistantTranscriptAggregate).toBe(
+        hasSource ? true : undefined,
       );
     },
   );

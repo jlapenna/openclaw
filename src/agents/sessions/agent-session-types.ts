@@ -1,6 +1,7 @@
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { ImageContent, Model } from "../../llm/types.js";
 import type { Agent, AgentEvent, AgentMessage, ThinkingLevel } from "../runtime/index.js";
+import type { AssistantTranscriptSource } from "./assistant-transcript-source.js";
 import type {
   ExtensionCommandContextActions,
   ExtensionErrorListener,
@@ -26,12 +27,6 @@ type AgentSessionCompactionEndEvent = {
   itemId?: string;
   reason: "manual" | "threshold" | "overflow";
   outcome: AgentSessionCompactionOutcome;
-};
-
-/** Live receipt for one physical assistant append; not part of provider or transcript bytes. */
-export type AssistantTranscriptSource = {
-  readonly occurrenceId: string;
-  readonly messageId?: string;
 };
 
 export type AgentSessionEvent =
