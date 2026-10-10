@@ -21,6 +21,7 @@ import {
 } from "../../infra/update-control-plane-sentinel.js";
 import type { DevUpdateTarget } from "../../infra/update-dev-target.js";
 import { resolveUpdateInstallRoot } from "../../infra/update-install-root.js";
+import { isCurrentManagedServiceUpdateHandoffProcess } from "../../infra/update-managed-service-handoff-current.js";
 import { createManagedHandoffLeaseStore } from "../../infra/update-managed-service-handoff-lease.js";
 import {
   cancelManagedServiceUpdateHandoff,
@@ -37,6 +38,7 @@ import { formatInstallationTargetCommand } from "../installation-target-format.j
 import { printResult } from "./progress.js";
 import { resolveNodeRunner, UpdatePreMutationError, type UpdateCommandOptions } from "./shared.js";
 import { releaseUpdateCommandPreflightForHandoff } from "./update-command-executor.js";
+import type { PreManagedServiceStop } from "./update-command-service-context-types.js";
 import { resolveOwnedManagedUpdateEnv } from "./update-command-service-env.js";
 
 function parsePositivePid(value: unknown): number | null {
@@ -53,7 +55,7 @@ const UPDATE_HANDOFF_IN_PROGRESS_EXIT_CODE = 75;
 const GATEWAY_ANCESTRY_SHELL_GUIDANCE =
   "Run this command from a shell outside the gateway service.";
 
-export function gatewayServiceMembershipBlock(
+function gatewayServiceMembershipBlock(
   pid: unknown,
   ancestry = inspectSelfAndAncestorPidsSync(undefined, { requireVerifiedParent: true }),
   systemdControlGroup?: string,
@@ -179,6 +181,38 @@ export function gatewayMaintenanceBlock(
         state.runtime?.systemd?.controlGroup,
         onAbsentSource,
       );
+}
+
+export async function mutableUpdateGatewayServiceBlock(params: {
+  preManagedServiceStop: PreManagedServiceStop | undefined;
+  root: string;
+  runId?: string;
+}) {
+  const stopState = params.preManagedServiceStop;
+  const ancestry = inspectSelfAndAncestorPidsSync(undefined, { requireVerifiedParent: true });
+  const inheritedPid = isGatewayServiceEnv(process.env)
+    ? parseStrictPositiveInteger(process.env[GATEWAY_SERVICE_RUNTIME_PID_ENV] ?? "")
+    : undefined;
+  // Another service's stopped state cannot authorize replacing the caller's Gateway.
+  const block =
+    (inheritedPid && (ancestry.pids.has(inheritedPid) || isPidAlive(inheritedPid))
+      ? gatewayServiceMembershipBlock(
+          inheritedPid,
+          ancestry,
+          inheritedPid === stopState?.servicePid ? stopState.serviceControlGroup : undefined,
+        )
+      : undefined) ??
+    (stopState?.running && !stopState.stopped
+      ? gatewayServiceMembershipBlock(stopState.servicePid, ancestry, stopState.serviceControlGroup)
+      : undefined);
+  return block &&
+    !(await isCurrentManagedServiceUpdateHandoffProcess({
+      root: params.root,
+      runId: params.runId,
+      env: process.env,
+    }))
+    ? block
+    : undefined;
 }
 
 export async function handoffUpdateFromGateway(params: {

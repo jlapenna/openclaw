@@ -1,7 +1,6 @@
 // Managed service identity, shutdown, and recovery shared by update and Doctor.
-import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
-import { GATEWAY_SERVICE_RUNTIME_PID_ENV, isGatewayServiceEnv } from "../../daemon/constants.js";
+import { isGatewayServiceEnv } from "../../daemon/constants.js";
 import { ScheduledTaskInspectionError } from "../../daemon/schtasks-state-probe.js";
 import { ScheduledTaskAutoStartRecoveryError } from "../../daemon/schtasks-update-recovery.js";
 import {
@@ -17,7 +16,6 @@ import {
 import { resolveGatewayService } from "../../daemon/service.js";
 import { readSystemdServiceExecStart } from "../../daemon/systemd-service-files.js";
 import { captureSystemdServiceIdentity } from "../../daemon/systemd-service-identity.js";
-import { inspectSelfAndAncestorPidsSync } from "../../infra/restart-stale-pids.js";
 import { parseTcpPortFromArgs } from "../../infra/tcp-port.js";
 import { UPDATE_RUN_ID_ENV } from "../../infra/update-control-plane-sentinel.js";
 import { isCurrentManagedServiceUpdateHandoffProcess } from "../../infra/update-managed-service-handoff-current.js";
@@ -28,12 +26,8 @@ import { hasCommandProcessCleanupError } from "../../process/exec-result.js";
 import { withCommandProcessScope } from "../../process/exec-spawn.js";
 import { defaultRuntime } from "../../runtime.js";
 import { createNullWriter } from "../../shared/null-writer.js";
-import { isPidAlive } from "../../shared/pid-alive.js";
 import { UpdatePreMutationError, type UpdateCommandOptions } from "./shared.js";
-import {
-  gatewayServiceMembershipBlock,
-  gatewayMaintenanceBlock,
-} from "./update-command-handoff.js";
+import { gatewayMaintenanceBlock } from "./update-command-handoff.js";
 import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-error.js";
 import type {
   ManagedGatewayUpdateVerdict,
@@ -647,6 +641,7 @@ async function stopManagedServiceBeforeMutableUpdate(
         env: currentState.env,
         stdout: params.jsonMode ? JSON_MODE_SERVICE_STDOUT : process.stdout,
         assertCurrent,
+        warn,
         ...(updateRun
           ? { updateHandoff: { root: params.handoffRoot ?? params.root, runId: updateRun.runId } }
           : {}),
@@ -716,36 +711,4 @@ async function stopManagedServiceBeforeMutableUpdate(
     stoppedAtMs,
     ...(windowsTaskAutoStartRecovery ? { windowsTaskAutoStartRecovery } : {}),
   };
-}
-
-export async function mutableUpdateGatewayServiceBlock(params: {
-  preManagedServiceStop: PreManagedServiceStop | undefined;
-  root: string;
-  runId?: string;
-}) {
-  const stopState = params.preManagedServiceStop;
-  const ancestry = inspectSelfAndAncestorPidsSync(undefined, { requireVerifiedParent: true });
-  const inheritedPid = isGatewayServiceEnv(process.env)
-    ? parseStrictPositiveInteger(process.env[GATEWAY_SERVICE_RUNTIME_PID_ENV] ?? "")
-    : undefined;
-  // Another service's stopped state cannot authorize replacing the caller's Gateway.
-  const block =
-    (inheritedPid && (ancestry.pids.has(inheritedPid) || isPidAlive(inheritedPid))
-      ? gatewayServiceMembershipBlock(
-          inheritedPid,
-          ancestry,
-          inheritedPid === stopState?.servicePid ? stopState.serviceControlGroup : undefined,
-        )
-      : undefined) ??
-    (stopState?.running && !stopState.stopped
-      ? gatewayServiceMembershipBlock(stopState.servicePid, ancestry, stopState.serviceControlGroup)
-      : undefined);
-  return block &&
-    !(await isCurrentManagedServiceUpdateHandoffProcess({
-      root: params.root,
-      runId: params.runId,
-      env: process.env,
-    }))
-    ? block
-    : undefined;
 }

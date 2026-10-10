@@ -65,9 +65,9 @@ import {
   verifyUpdatedGateway,
 } from "./update-command-verification.js";
 
+export { mutableUpdateGatewayServiceBlock } from "./update-command-handoff.js";
 export {
   maybeStopManagedServiceBeforeMutableUpdate,
-  mutableUpdateGatewayServiceBlock,
   UpdateCommandAbort,
   type PreManagedServiceStop,
   type UpdateCommandRecoveryState,
