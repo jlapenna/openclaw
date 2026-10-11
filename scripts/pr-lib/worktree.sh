@@ -124,45 +124,49 @@ list_pr_worktrees() {
 }
 
 gc_pr_worktrees() {
-  local dry_run="${1:-false}"
+  local delete="${1:-false}"
   local root
   root=$(repo_root)
   cd "$root"
 
-  local dir
-  local removed=0
+  local pruner="$root/node_modules/.bin/repo-prune-merged-worktrees"
+  [ -x "$pruner" ] || { echo "Missing repo-tools; run pnpm install in $root" >&2; return 1; }
+  local dir found=false failed=0
   for dir in .worktrees/pr-*; do
     [ -d "$dir" ] || continue
+    found=true
     local pr
     if ! pr=$(pr_number_from_worktree_dir "$dir"); then
-      echo "skipping $dir (could not parse PR number)"
+      printf 'KEEP\t%s\t\tunverified:pr-number\n' "$root/$dir"
       continue
     fi
-    local state
-    state=$(gh pr view "$pr" --json state --jq .state 2>/dev/null || printf 'UNKNOWN')
-    case "$state" in
-      MERGED|CLOSED)
-        if [ "$dry_run" = "true" ]; then
-          echo "would remove $dir (PR #$pr state=$state)"
-        else
-          remove_worktree_if_present "$dir"
-          delete_local_branch_if_safe "temp/pr-$pr"
-          delete_local_branch_if_safe "pr-$pr"
-          delete_local_branch_if_safe "pr-$pr-prep"
-          echo "removed $dir (PR #$pr state=$state)"
-        fi
-        removed=$((removed + 1))
-        ;;
-    esac
+    # Stored JSON binds the temporary checkout to its actual upstream PR.
+    # Never source shell metadata or infer routing from a fork's default remote.
+    local meta="$dir/.local/pr-meta.json" url head report status=0
+    head=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+    if ! url=$(jq -er --argjson pr "$pr" --arg head "$head" '
+      select(.number == $pr and .headRefOid == $head) | .url |
+      select(type == "string" and test("^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/" + ($pr|tostring) + "$"))
+    ' "$meta" 2>/dev/null); then
+      printf 'KEEP\t%s\t\tunverified:pr-metadata\n' "$root/$dir"
+      continue
+    fi
+    local args=(--repo "$root" --merged-pr "$url" "$root/$dir")
+    [ "$delete" != "true" ] || args=(--delete "${args[@]}")
+    report=$("$pruner" "${args[@]}") || status=$?
+    printf '%s\n' "$report"
+    # KEEP is a normal sweep result. Failed removals and invocation errors
+    # remain errors; do not delete unrelated pr-* or prep branch refs.
+    if [ "$status" -ne 0 ] && ! printf '%s\n' "$report" | awk -F '\t' '
+      $1 == "KEEP" { kept=1 } $1 == "FAILED" { failed=1 }
+      END { exit !(kept && !failed) }
+    '; then
+      failed=1
+    fi
   done
 
-  if [ "$removed" -eq 0 ]; then
-    if [ "$dry_run" = "true" ]; then
-      echo "No merged/closed PR worktrees eligible for removal."
-    else
-      echo "No merged/closed PR worktrees removed."
-    fi
-  fi
+  [ "$found" != "false" ] || echo "No PR worktrees found."
+  return "$failed"
 }
 
 pr_number_from_worktree_dir() {

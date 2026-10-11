@@ -18,7 +18,7 @@ usage() {
   cat <<USAGE
 Usage:
   scripts/pr ls
-  scripts/pr gc [--dry-run]
+  scripts/pr gc [--delete]
   scripts/pr review-init <PR>
   scripts/pr review-checkout-main <PR>
   scripts/pr review-checkout-pr <PR>
@@ -86,11 +86,12 @@ main() {
       list_pr_worktrees
       ;;
     gc)
-      local dry_run=false
-      if [ "${1-}" = "--dry-run" ]; then
-        dry_run=true
+      local delete=false
+      if [ "$#" -gt 0 ]; then
+        [ "$#" -eq 1 ] && [ "$1" = "--delete" ] || { usage >&2; exit 2; }
+        delete=true
       fi
-      gc_pr_worktrees "$dry_run"
+      gc_pr_worktrees "$delete"
       ;;
     review-init)
       local pr="${1-}"
