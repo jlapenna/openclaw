@@ -9,9 +9,6 @@ import { resolveIngressWorkspaceOverrideForSessionRun } from "../../agents/spawn
 import type { SilentReplyPromptMode } from "../../agents/system-prompt.types.js";
 import { resolveEffectiveAgentRuntime } from "../../agents/thinking-runtime.js";
 import { copyChannelParticipantAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
-import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
-import { resolveSilentReplySettings } from "../../config/silent-reply.js";
-import { logVerbose } from "../../globals.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { isFastTestRuntimeEnv } from "../../infra/env.js";
 import {
@@ -27,10 +24,8 @@ import {
 } from "../command-turn-context.js";
 import { resolveEnvelopeFormatOptions } from "../envelope.js";
 import { normalizeThinkLevel } from "../thinking.js";
-import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import { applySessionHints } from "./body.js";
 import { resolveTurnModelOverride } from "./dispatch-from-config.harness-defaults.js";
-import { resolveReplyPolicyConversationType } from "./get-reply-conversation-type.js";
 import { shouldUseReplyFastTestRuntime } from "./get-reply-fast-path.js";
 import {
   buildExecOverridePromptHint,
@@ -39,7 +34,7 @@ import {
   hasReplyTargetContext,
 } from "./get-reply-run-helpers.js";
 import type { RunPreparedReplyParams } from "./get-reply-run.types.js";
-import { buildDirectChatContext, buildGroupChatContext, buildGroupIntro } from "./groups.js";
+import { buildGroupIntro, buildSourceConversationContext } from "./groups.js";
 import { hasInboundMedia } from "./inbound-media.js";
 import {
   buildInboundMetaSystemPrompt,
@@ -87,7 +82,6 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     resetTriggered,
     systemSent,
     sessionKey,
-    storePath,
     workspaceDir: configuredWorkspaceDir,
     sessionEntryHandle,
     sessionStore,
@@ -95,6 +89,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const runtimePolicySessionKey = resolveRuntimePolicySessionKey({ agentId, cfg, ctx, sessionKey });
   const { resolvedElevatedLevel, execOverrides, abortedLastRun, sessionEntry } = params;
   const isHeartbeat = opts?.isHeartbeat === true;
+  const isInternalEvent = opts?.internalEventExecution !== undefined;
   const explicitThinkingLevelOverride = normalizeThinkLevel(opts?.thinkingLevelOverride);
   const effectiveQueueMode = opts?.queueModeOverride ?? perMessageQueueMode;
   const traceAttributes = {
@@ -136,7 +131,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const sessionPromptSourceReplyDeliveryMode =
     opts?.sessionPromptSourceReplyDeliveryMode ??
     (isSyntheticTurn && sessionEntry
-      ? resolveSessionStableReplyMode({
+      ? await resolveSessionStableReplyMode({
           cfg,
           ctx: { ...promptSessionCtx, CommandAuthorized: false },
           sessionEntry,
@@ -146,16 +141,6 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
           turnModelOverride: resolveTurnModelOverride(opts),
         })
       : sourceReplyDeliveryMode);
-  const silentReplyConversationType = resolveReplyPolicyConversationType(
-    promptSessionCtx,
-    ctx.SessionKey,
-  );
-  const silentReplySettings = resolveSilentReplySettings({
-    cfg,
-    sessionKey: runtimePolicySessionKey,
-    surface: promptSessionCtx.Surface ?? promptSessionCtx.Provider,
-    conversationType: silentReplyConversationType,
-  });
   const useFastReplyRuntime = shouldUseReplyFastTestRuntime({
     cfg,
     isFastTestEnv: isFastTestRuntimeEnv(),
@@ -179,7 +164,6 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const isFirstTurnInSession = isNewSession || !systemSent;
   const isGroupChat =
     promptSessionCtx.ChatType === "group" || promptSessionCtx.ChatType === "channel";
-  const isDirectChat = promptSessionCtx.ChatType === "direct" || promptSessionCtx.ChatType === "dm";
   const { typingPolicy, suppressTyping } = resolveRunTypingPolicy({
     requestedPolicy: opts?.typingPolicy,
     suppressTyping: opts?.suppressTyping === true,
@@ -198,21 +182,14 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
   const shouldInjectGroupIntro = Boolean(
     isGroupChat && (isFirstTurnInSession || sessionEntry?.groupActivationNeedsSystemIntro),
   );
-  const buildSourceConversationContext = (mode: typeof sourceReplyDeliveryMode) => {
-    const conversationContext = { sourceReplyDeliveryMode: mode, sessionCtx: promptSessionCtx };
-    return isDirectChat
-      ? buildDirectChatContext(conversationContext)
-      : isGroupChat
-        ? buildGroupChatContext({
-            ...conversationContext,
-            silentReplyPolicy: silentReplySettings.policy,
-            silentToken: SILENT_REPLY_TOKEN,
-          })
-        : "";
-  };
+  const sourceConversationContext = (mode: typeof sourceReplyDeliveryMode) =>
+    buildSourceConversationContext({
+      sourceReplyDeliveryMode: mode,
+      sessionCtx: promptSessionCtx,
+    });
   const sourceConversationContextByMode = {
-    automatic: buildSourceConversationContext("automatic"),
-    message_tool_only: buildSourceConversationContext("message_tool_only"),
+    automatic: sourceConversationContext("automatic"),
+    message_tool_only: sourceConversationContext("message_tool_only"),
   };
   // CLI sessions keep their creation-time conversation prompt. Embedded attempts
   // can instead select the variant owned by their final prepared harness.
@@ -228,12 +205,15 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     isHeartbeat,
   });
   const replyOperationRunState = resolveReplyOperationRunState(opts);
-  if (replyOperationRunState) {
-    replyOperationRunState.replyCompletion = resolveReplyCompletion(
-      terminalReplyExpectation,
-      "empty",
-    );
-  }
+  const setReplyCompletion = (evidence: Parameters<typeof resolveReplyCompletion>[1]) => {
+    if (replyOperationRunState) {
+      replyOperationRunState.replyCompletion = resolveReplyCompletion(
+        terminalReplyExpectation,
+        evidence,
+      );
+    }
+  };
+  setReplyCompletion("empty");
   const groupSystemPrompt = normalizeOptionalString(promptSessionCtx.GroupSystemPrompt) ?? "";
   const inboundMetaPrompt = buildInboundMetaSystemPrompt(
     isNewSession ? promptSessionCtx : { ...promptSessionCtx, ThreadStarterBody: undefined },
@@ -266,7 +246,10 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
       : {}),
   };
   const silentReplyPromptMode: SilentReplyPromptMode =
-    sessionStableConversationContext || sourceReplyDeliveryMode === "message_tool_only"
+    isInternalPromptChannel ||
+    terminalReplyExpectation === "result-required" ||
+    sessionStableConversationContext ||
+    sourceReplyDeliveryMode === "message_tool_only"
       ? "none"
       : "generic";
   const baseBody = sessionCtx.agentText ?? "";
@@ -296,12 +279,7 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     (!commandAuthorized || !command.isAuthorizedSender) &&
     isRegisteredWholeMessageCommand
   ) {
-    if (replyOperationRunState) {
-      replyOperationRunState.replyCompletion = resolveReplyCompletion(
-        terminalReplyExpectation,
-        "blocked",
-      );
-    }
+    setReplyCompletion("blocked");
     opts?.onDeliberateSilentTerminalReply?.();
     return finishReplyPreparation(typing);
   }
@@ -361,7 +339,6 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
     if (!suppressTyping) {
       await typing.onReplyStart();
     }
-    logVerbose("Inbound body empty after normalization; skipping agent run");
     return finishReplyPreparation(typing, () => ({
       text: "I didn't receive any text in your message. Please resend or add a caption.",
     }));
@@ -376,34 +353,33 @@ export async function prepareReplyRunContext(params: RunPreparedReplyParams) {
           : {}),
       }
     : { ...sessionCtx, ThreadStarterBody: undefined };
-  let inboundContextSessionEntry = isHeartbeat
-    ? undefined
-    : ((sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
-      sessionEntryHandle?.getCurrent() ??
-      sessionEntry);
-  // Heartbeats are synthetic system turns: delivery facts still drive routing and
-  // formatting, but must not be presented to the model as user-role inbound context.
+  let inboundContextSessionEntry =
+    isHeartbeat || isInternalEvent
+      ? undefined
+      : ((sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
+        sessionEntryHandle?.getCurrent() ??
+        sessionEntry);
+  // Synthetic turns retain routing facts without inventing user-role inbound context.
   const buildInboundContextState = () => ({
     activeGoalContext: formatActiveGoalContext(inboundContextSessionEntry),
-    inboundUserContext: isHeartbeat
-      ? ""
-      : buildInboundUserContextPrefix(
-          inboundUserContextSessionCtx,
-          envelopeOptions,
-          inboundContextSessionEntry,
-        ),
+    inboundUserContext:
+      isHeartbeat || isInternalEvent
+        ? ""
+        : buildInboundUserContextPrefix(
+            inboundUserContextSessionCtx,
+            envelopeOptions,
+            inboundContextSessionEntry,
+          ),
   });
   let { activeGoalContext, inboundUserContext } = buildInboundContextState();
-  const refreshInboundContextAfterAdmissionWait = async () => {
-    if (isHeartbeat) {
+  const refreshInboundContextAfterAdmissionWait = () => {
+    if (isHeartbeat || isInternalEvent) {
       return;
     }
     inboundContextSessionEntry =
-      storePath && sessionKey
-        ? loadSessionEntry({ storePath, sessionKey, readConsistency: "latest" })
-        : (sessionEntryHandle?.getCurrent() ??
-          (sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
-          sessionEntry);
+      sessionEntryHandle?.getCurrent() ??
+      (sessionKey !== undefined ? sessionStore?.[sessionKey] : undefined) ??
+      sessionEntry;
     ({ activeGoalContext, inboundUserContext } = buildInboundContextState());
   };
   const inboundUserContextPromptJoiner = resolveInboundUserContextPromptJoiner(sessionCtx);

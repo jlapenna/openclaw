@@ -6,7 +6,6 @@ import {
   readDeferredPluginMigrations,
   recordDeferredPluginMigrations,
 } from "../infra/deferred-plugin-migrations.js";
-import { resolvePrivateSqliteSnapshotStagingRoot } from "../infra/sqlite-private-directory.js";
 import * as sqliteReadOnlyWorker from "../infra/sqlite-readonly-worker.js";
 import {
   clearBundledDiscoveryModeMemo,
@@ -14,10 +13,7 @@ import {
 } from "../plugins/bundled-discovery-state.js";
 import { createPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import {
-  withArtifactPreservingStateReads,
-  withSynchronousArtifactPreservingStateSnapshot,
-} from "../state/openclaw-state-db-readonly.js";
+import { withArtifactPreservingStateReads } from "../state/openclaw-state-db-readonly.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
@@ -28,9 +24,7 @@ import * as configHealth from "./io.health-state.js";
 import * as pluginMetadata from "./io.plugin-metadata.js";
 import { hashConfigRaw } from "./io.read-helpers.js";
 import { readCurrentConfigForPolicyCheckAsync } from "./io.runtime.js";
-import * as snapshotPreparation from "./io.snapshot-preparation.js";
 import { createConfigIoWorkerFixture } from "./io.worker.test-support.js";
-import { registerManagedRuntimeConfigWriteOwner } from "./runtime-snapshot.js";
 import type { ConfigFileSnapshot } from "./types.js";
 
 const shell = vi.hoisted(() => ({ load: vi.fn() }));
@@ -82,62 +76,8 @@ function fixture(raw?: string) {
   return { ...options, io: createConfigIO(options) };
 }
 
-it.each(["sync", "async"] as const)(
-  "reads current runtime migration obligations without full database snapshots (%s)",
-  async (mode) => {
-    const options = fixture(JSON.stringify({ gateway: { mode: "local" } }));
-    const pending = {
-      pluginId: "fixture-plugin",
-      reason: "Missing plugin",
-      command: "openclaw doctor --fix",
-    };
-    await recordDeferredPluginMigrations({ env: options.env, pending: [pending] });
-    await closeOpenClawStateDatabaseAsync();
-    const synchronousSnapshot = vi.spyOn(sqliteReadOnlyWorker, "runSqliteReadOnlyWorkerSync");
-    const context = configContext.createConfigIoContext(options);
-    const read = () =>
-      mode === "sync"
-        ? context.resolveDeferredPluginMigrations()
-        : context.resolveDeferredPluginMigrationsAsync();
-    const coldStagingRoot = resolvePrivateSqliteSnapshotStagingRoot();
-    fs.mkdirSync(path.dirname(coldStagingRoot), { recursive: true });
-    const stagingRoot = resolvePrivateSqliteSnapshotStagingRoot();
-    // The isolated root retains create/remove evidence even when fs.watch drops transient events.
-    const sentinel = new Date("2000-01-01T00:00:00.000Z");
-    fs.utimesSync(stagingRoot, sentinel, sentinel);
-    const stagingMtime = fs.statSync(stagingRoot).mtimeMs;
-    expect(await read()).toEqual([pending]);
-    const loaded = mode === "sync" ? options.io.loadConfig() : await options.io.loadConfigAsync();
-    expect(loaded.gateway?.mode).toBe("local");
-    await recordDeferredPluginMigrations({
-      env: options.env,
-      pending: [{ ...pending, reason: "Changed obligation" }],
-    });
-    await closeOpenClawStateDatabaseAsync();
-    expect(await read()).toEqual([{ ...pending, reason: "Changed obligation" }]);
-    expect(synchronousSnapshot).not.toHaveBeenCalled();
-    expect(fs.statSync(stagingRoot).mtimeMs).toBe(stagingMtime);
-    expect(
-      await withArtifactPreservingStateReads(() =>
-        mode === "sync"
-          ? withSynchronousArtifactPreservingStateSnapshot(() =>
-              context.resolveDeferredPluginMigrations(),
-            )
-          : context.resolveDeferredPluginMigrationsAsync(),
-      ),
-    ).toEqual([{ ...pending, reason: "Changed obligation" }]);
-    if (mode === "sync") {
-      expect(synchronousSnapshot).toHaveBeenCalledTimes(1);
-      expect(path.dirname(synchronousSnapshot.mock.calls[0]?.[1] ?? "")).toBe(stagingRoot);
-    } else {
-      expect(synchronousSnapshot).not.toHaveBeenCalled();
-    }
-    expect(fs.statSync(stagingRoot).mtimeMs).not.toBe(stagingMtime);
-  },
-);
-
-it.each(["load", "snapshot", "policy"] as const)(
-  "%s reads retained migration inputs without synchronous SQLite work or artifact changes",
+it.each(["load", "snapshot", "metadata", "write-snapshot", "policy"] as const)(
+  "%s consumes canonical config without reading pending migrations or changing artifacts",
   async (method) => {
     const raw = JSON.stringify({
       gateway: { mode: "local" },
@@ -158,16 +98,8 @@ it.each(["load", "snapshot", "policy"] as const)(
     const familyBefore = family.map((file) => (fs.existsSync(file) ? fs.readFileSync(file) : null));
     const mainSql = observeMainThreadSql();
     const synchronousSnapshot = vi.spyOn(sqliteReadOnlyWorker, "runSqliteReadOnlyWorkerSync");
-    const unregister =
-      method === "snapshot"
-        ? registerManagedRuntimeConfigWriteOwner(
-            options.configPath,
-            undefined,
-            snapshotPreparation.prepareHostConfigSnapshot,
-          )
-        : undefined;
     try {
-      const config = await withArtifactPreservingStateReads(() =>
+      const read = () =>
         withPluginCache(createPluginCache(), async () => {
           if (method === "policy") {
             return await readCurrentConfigForPolicyCheckAsync(options);
@@ -176,17 +108,24 @@ it.each(["load", "snapshot", "policy"] as const)(
           if (method === "load") {
             return await io.loadConfigAsync();
           }
-          const snapshot = await io.readConfigFileSnapshot();
+          const snapshot =
+            method === "metadata"
+              ? (await io.readConfigFileSnapshotWithPluginMetadata()).snapshot
+              : method === "write-snapshot"
+                ? (await io.readConfigFileSnapshotForWrite()).snapshot
+                : await io.readConfigFileSnapshot();
           expect(snapshot).toMatchObject({ valid: true, raw });
           return snapshot.config;
-        }),
-      );
+        });
+      // Plain loads use their caller's inspection scope; snapshot APIs own theirs.
+      const config = await (method === "load" || method === "policy"
+        ? withArtifactPreservingStateReads(read)
+        : read());
       expect(config.gateway?.mode).toBe("local");
-      expect(config).not.toHaveProperty("session.store");
+      expect(config).toHaveProperty("session.store", "/srv/synthetic-session-state/sessions.json");
       expect(synchronousSnapshot).not.toHaveBeenCalled();
       mainSql.expectIdle();
     } finally {
-      unregister?.();
       mainSql.restore();
     }
     expect(fs.readFileSync(options.configPath, "utf8")).toBe(raw);
@@ -218,73 +157,6 @@ it("rejects an invalid async load and rolls back its injected config environment
   await expect(io.loadConfigAsync()).rejects.toMatchObject({ code: "INVALID_CONFIG" });
   expect(env.CONFIG_FIXTURE_VALUE).toBeUndefined();
 });
-
-it.each(["metadata", "handoff"] as const)(
-  "refuses snapshot results after its host owner is replaced during %s",
-  async (phase) => {
-    const options = fixture(JSON.stringify({ gateway: { mode: "local" } }));
-    const prepared = createDeferredCore();
-    const release = createDeferredCore();
-    const resolveMetadata = pluginMetadata.resolveConfigWidePluginMetadataSnapshotAsync;
-    vi.spyOn(pluginMetadata, "resolveConfigWidePluginMetadataSnapshotAsync").mockImplementation(
-      async (params) => {
-        const result = await resolveMetadata(params);
-        if (phase === "metadata") {
-          prepared.resolve();
-          await release.promise;
-        }
-        return result;
-      },
-    );
-    const unregister = registerManagedRuntimeConfigWriteOwner(
-      options.configPath,
-      undefined,
-      snapshotPreparation.prepareHostConfigSnapshot,
-    );
-    const snapshot = withArtifactPreservingStateReads(() =>
-      withPluginCache(createPluginCache(), () =>
-        createConfigIO({
-          ...options,
-          observe: false,
-          measure: async (name, run) => {
-            const result = await run();
-            if (phase === "handoff" && name === "config.snapshot.read.observe") {
-              prepared.resolve();
-              await release.promise;
-            }
-            return result;
-          },
-        }).readConfigFileSnapshot(),
-      ),
-    );
-    let unregisterSuccessor: (() => void) | undefined;
-    try {
-      await Promise.race([
-        prepared.promise,
-        snapshot.then(() => {
-          throw new Error("snapshot completed without its registered preparation");
-        }),
-      ]);
-      unregister();
-      const successor = vi.spyOn(snapshotPreparation, "prepareHostConfigSnapshot");
-      unregisterSuccessor = registerManagedRuntimeConfigWriteOwner(
-        options.configPath,
-        undefined,
-        snapshotPreparation.prepareHostConfigSnapshot,
-      );
-      release.resolve();
-      await expect(snapshot).rejects.toThrow(
-        "Gateway config snapshot preparation owner has closed",
-      );
-      expect(successor).not.toHaveBeenCalled();
-    } finally {
-      release.resolve();
-      unregister();
-      unregisterSuccessor?.();
-      await snapshot.catch(() => {});
-    }
-  },
-);
 
 it("uses the same fresh-install defaults for a missing async configuration", async () => {
   const { io } = fixture();
@@ -322,7 +194,7 @@ it.each(["full", "core-only"] as const)(
 );
 
 it("rechecks the cold reader before observation after delayed metadata preparation", async () => {
-  const raw = JSON.stringify({ gateway: { mode: "local" } });
+  const raw = JSON.stringify({ gateway: { mode: "local" }, plugins: { enabled: false } });
   const { io, env, homedir, configPath, logger } = fixture(raw);
   const started = createDeferredCore();
   const release = createDeferredCore();

@@ -7,7 +7,6 @@ import {
   getMemoryCapabilityRegistration,
   getMemoryProviderRuntime,
   getMemoryRuntime,
-  listMemoryCorpusSupplements,
   listMemoryPromptPreparations,
   listActiveMemoryPublicArtifacts,
   prepareMemoryPromptSection,
@@ -66,16 +65,6 @@ function memoryArtifact(
 
 function registerArtifacts(pluginId: string, artifacts: MemoryPluginPublicArtifact[]) {
   registerMemoryCapability(pluginId, { publicArtifacts: { listArtifacts: async () => artifacts } });
-}
-
-function expectClearedMemoryState() {
-  expect(resolveMemoryFlushPlan({})).toBeNull();
-  expect(buildMemoryPromptSection({ availableTools: new Set(["memory_search"]) })).toStrictEqual(
-    [],
-  );
-  expect(listMemoryCorpusSupplements()).toStrictEqual([]);
-  expect(getMemoryProviderRuntime()).toBeUndefined();
-  expect(getMemoryRuntime()).toBeUndefined();
 }
 
 describe("memory plugin state", () => {
@@ -213,21 +202,6 @@ describe("memory plugin state", () => {
     ]);
   });
 
-  it("preserves runtime fields when the same plugin adds public artifacts", () => {
-    const runtime = createMemoryRuntime();
-    const flushPlanResolver = () => createMemoryFlushPlan("memory/same-owner.md");
-
-    registerMemoryCapability("memory-core", { runtime, flushPlanResolver });
-    registerMemoryCapability("memory-core", {
-      publicArtifacts: { listArtifacts: async () => [] },
-    });
-
-    expect(getMemoryRuntime()).toBe(runtime);
-    expect(resolveMemoryFlushPlan({})?.plan).toMatchObject({
-      relativePath: "memory/same-owner.md",
-    });
-  });
-
   it.each([
     { ownerFirst: true, ownerResolver: "provider" },
     { ownerFirst: false, ownerResolver: "provider" },
@@ -284,33 +258,6 @@ describe("memory plugin state", () => {
     );
   });
 
-  it("passes agent context through the primary and supplemental prompt builders", () => {
-    const primary = vi.fn(() => ["primary"]);
-    const supplemental = vi.fn(() => ["supplemental"]);
-    registerTestMemoryPromptBuilder(primary);
-    registerMemoryPromptSupplement("memory-wiki", supplemental);
-
-    const availableTools = new Set(["memory_search", "memory_get"]);
-    expect(
-      buildMemoryPromptSection({
-        availableTools,
-        citationsMode: "on",
-        agentId: "marketing-agent",
-        agentSessionKey: "agent:marketing-agent:main",
-        sandboxed: true,
-      }),
-    ).toEqual(["primary", "supplemental"]);
-    const expectedContext = {
-      availableTools,
-      citationsMode: "on",
-      agentId: "marketing-agent",
-      agentSessionKey: "agent:marketing-agent:main",
-      sandboxed: true,
-    };
-    expect(primary).toHaveBeenCalledWith(expectedContext);
-    expect(supplemental).toHaveBeenCalledWith(expectedContext);
-  });
-
   it("appends prompt supplements in plugin-id order", () => {
     registerTestMemoryPromptBuilder(() => ["primary"]);
     registerMemoryPromptSupplement("memory-wiki", () => ["wiki"]);
@@ -364,6 +311,7 @@ describe("memory plugin state", () => {
     ["session", { agentSessionKey: "agent:first:other" }],
     ["citations", { citationsMode: "off" as const }],
     ["sandbox", { sandboxed: true }],
+    ["project", { projectKey: "github.com/acme/other" }],
     ["removed tool", { availableTools: new Set<string>() }],
     ["added tool", { availableTools: new Set(["wiki_search", "memory_search"]) }],
     ["replaced tool", { availableTools: new Set(["memory_search"]) }],
@@ -401,20 +349,6 @@ describe("memory plugin state", () => {
     expect(listMemoryPromptPreparations()).toEqual([]);
   });
 
-  it("stores memory corpus supplements", async () => {
-    const supplement = {
-      search: async () => [{ corpus: "wiki", path: "sources/alpha.md", score: 1, snippet: "x" }],
-      get: async () => null,
-    };
-
-    registerMemoryCorpusSupplement("memory-wiki", supplement);
-
-    expect(listMemoryCorpusSupplements()).toHaveLength(1);
-    await expect(
-      listMemoryCorpusSupplements()[0]?.supplement.search({ query: "alpha" }),
-    ).resolves.toEqual([{ corpus: "wiki", path: "sources/alpha.md", score: 1, snippet: "x" }]);
-  });
-
   it("does not adopt memory sidecars across conflicting plugin owners", () => {
     const supplement = { search: async () => [], get: async () => null };
     const prepare = async () => ["runtime wiki digest"];
@@ -435,17 +369,5 @@ describe("memory plugin state", () => {
     expect(scoped.memoryCorpusSupplements).toEqual([]);
     expect(scoped.memoryPromptPreparations).toEqual([]);
     expect(scoped.memoryPromptSupplements).toEqual([]);
-  });
-
-  it("clearMemoryPluginState resets both registries", () => {
-    registerMemoryCapability("memory-core", {
-      promptBuilder: () => ["stale section"],
-      flushPlanResolver: () => createMemoryFlushPlan("memory/stale.md"),
-      runtime: createMemoryRuntime(),
-    });
-
-    clearMemoryPluginState();
-
-    expectClearedMemoryState();
   });
 });

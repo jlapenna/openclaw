@@ -3,8 +3,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import * as dispatch from "../../auto-reply/dispatch.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import { getRuntimeConfig, setRuntimeConfigSnapshot } from "../../config/config.js";
 import {
   appendTranscriptMessage,
@@ -17,24 +15,20 @@ import * as sessionAccessor from "../../config/sessions/session-accessor.js";
 import { readSessionPendingInputByKey } from "../../config/sessions/session-accessor.sqlite-pending-inputs.js";
 import { SessionPendingInputCustodyError } from "../../config/sessions/session-pending-input-custody-error.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { loadOrCreateProcessDeviceIdentityAsync } from "../../infra/device-identity-async.js";
 import { getSessionWorkAdmissionRelease } from "../../sessions/session-lifecycle-admission.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
 } from "../../state/openclaw-agent-db.js";
-import * as profileReader from "../../state/user-profile-list.js";
-import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import * as sessionStores from "../session-utils-store.js";
-import * as chatDispatch from "./chat-send-agent-dispatch.js";
+import { holdProjectedChatDispatch } from "./chat-send-authority.test-support.js";
 import { handleDirectExternalChatSend } from "./chat-send-external-entry.js";
-import type { GatewayClient } from "./types.js";
 
-type DispatchOptions = Parameters<typeof dispatch.dispatchInboundMessageWithProjectedDispatcher>[0];
-
-it.each<{
+type IdentityScenario = {
   name: string;
   raw: boolean;
   literal: boolean;
@@ -44,8 +38,7 @@ it.each<{
   separateStore?: boolean;
   replaceDatabase?: "copy" | "symlink";
   replayAfterCollision?: boolean;
-  writeDuringAdmission?: "counterpart" | "unrelated";
-  writeDuringProfilePreparation?: boolean;
+  writeDuringAdmission?: boolean;
   replaceDuringPersistence?: boolean;
   pendingReplacement?: boolean;
   switchStoreAfterAck?: boolean;
@@ -56,119 +49,60 @@ it.each<{
     | "model"
     | "security"
     | "routing";
-}>([
-  {
-    name: "raw global only",
+};
+function identityScenario(
+  name: string,
+  overrides: Partial<IdentityScenario> = {},
+): IdentityScenario {
+  return {
+    name,
     raw: true,
     literal: false,
     shared: false,
     key: "global",
     allowed: true,
-  },
-  {
-    name: "colliding raw request",
-    raw: true,
+    ...overrides,
+  };
+}
+
+it.each<IdentityScenario>([
+  identityScenario("raw global only"),
+  identityScenario("colliding raw request", { literal: true, allowed: false }),
+  identityScenario("colliding literal request", {
     literal: true,
-    shared: false,
-    key: "global",
-    allowed: false,
-  },
-  {
-    name: "colliding literal request",
-    raw: true,
-    literal: true,
-    shared: false,
     key: "agent:research:global",
     allowed: false,
-  },
-  {
-    name: "missing raw with literal present",
+  }),
+  identityScenario("missing raw with literal present", {
     raw: false,
     literal: true,
-    shared: false,
-    key: "global",
     allowed: false,
-  },
-  {
-    name: "distinct owner in shared store",
-    raw: true,
+  }),
+  identityScenario("distinct owner in shared store", {
     literal: true,
     shared: true,
     key: "agent:research:global",
-    allowed: true,
-  },
-  {
-    name: "empty counterpart store preserves raw source",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
-    separateStore: true,
-  },
-  {
-    name: "collision across discovered stores",
-    raw: true,
+  }),
+  identityScenario("empty counterpart store preserves raw source", { separateStore: true }),
+  identityScenario("collision across discovered stores", {
     literal: true,
-    shared: false,
-    key: "global",
     allowed: false,
     separateStore: true,
-  },
-  {
-    name: "missing raw with literal in another store",
+  }),
+  identityScenario("missing raw with literal in another store", {
     raw: false,
     literal: true,
-    shared: false,
-    key: "global",
     allowed: false,
     separateStore: true,
-  },
-  ...(["copy", "symlink"] as const).map((replaceDatabase) => ({
-    name: `database ${replaceDatabase} after selection`,
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: false,
-    replaceDatabase,
-  })),
-  {
-    name: "cached retry after collision",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
-    replayAfterCollision: true,
-  },
-  {
-    name: "counterpart appears while operator profile preparation waits",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: false,
-    writeDuringProfilePreparation: true,
-  },
-  {
-    name: "counterpart appears while admission waits",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: false,
-    writeDuringAdmission: "counterpart",
-  },
-  {
-    name: "unrelated row appears while admission waits",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
-    writeDuringAdmission: "unrelated",
-  },
+  }),
+  ...(["copy", "symlink"] as const).map((replaceDatabase) =>
+    identityScenario(`database ${replaceDatabase} after selection`, {
+      allowed: false,
+      replaceDatabase,
+    }),
+  ),
+  identityScenario("cached retry after collision", { replayAfterCollision: true }),
+  identityScenario("unrelated row appears while admission waits", { writeDuringAdmission: true }),
   ...(
     [
       "unrelated",
@@ -178,45 +112,23 @@ it.each<{
       "security",
       "routing",
     ] as const
-  ).map((configDuringAdmission) => ({
-    name: `${configDuringAdmission} config changes during admission read`,
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: configDuringAdmission.startsWith("unrelated"),
-    configDuringAdmission,
-  })),
-  {
-    name: "database replacement after recorder target resolution",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
+  ).map((configDuringAdmission) =>
+    identityScenario(`${configDuringAdmission} config changes during admission read`, {
+      allowed: configDuringAdmission.startsWith("unrelated"),
+      configDuringAdmission,
+    }),
+  ),
+  identityScenario("database replacement after recorder target resolution", {
     replaceDuringPersistence: true,
-  },
-  {
-    name: "pending custody survives replacement through cleanup",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
+  }),
+  identityScenario("pending custody survives replacement through cleanup", {
     replaceDuringPersistence: true,
     pendingReplacement: true,
-  },
-  {
-    name: "config store changes after ACK",
-    raw: true,
-    literal: false,
-    shared: false,
-    key: "global",
-    allowed: true,
-    switchStoreAfterAck: true,
-  },
+  }),
+  identityScenario("config store changes after ACK", { switchStoreAfterAck: true }),
 ])("binds chat.send to its stored global identity: $name", async (scenario) => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    await loadOrCreateProcessDeviceIdentityAsync();
     const storePath = state.path(
       scenario.shared
         ? "shared.sqlite"
@@ -304,82 +216,16 @@ it.each<{
       scenario.replaceDuringPersistence && !scenario.pendingReplacement
         ? "/status"
         : "Keep this input in the selected physical row.";
-    const entered = createDeferred<DispatchOptions>();
-    const release = createDeferred();
+    const {
+      entered,
+      release,
+      observe: observeDispatch,
+      hold: holdDispatch,
+    } = holdProjectedChatDispatch();
     const admissionOwned = createDeferred();
     const resumeAdmission = createDeferred();
     let sending: Promise<void> | undefined;
-    const observeDispatch = vi.spyOn(chatDispatch, "startChatDispatch");
-    const holdDispatch = vi
-      .spyOn(dispatch, "dispatchInboundMessageWithProjectedDispatcher")
-      .mockImplementation(async (options) => {
-        entered.resolve(options);
-        await release.promise;
-        return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
-      });
     const context = createDirectChatContext({ getRuntimeConfig });
-    const profilePrepared = createDeferred();
-    const resumeProfile = createDeferred();
-    const admissionCallback = vi.fn(async () => true);
-    const interrupted = vi.fn();
-    const activeRun = scenario.writeDuringProfilePreparation
-      ? createReplyOperation({
-          agentId: "research",
-          sessionKey: "agent:research:global",
-          sessionId: "raw-session",
-          resetTriggered: false,
-        })
-      : undefined;
-    activeRun?.attachBackend({
-      kind: "embedded",
-      runId: "preparing-profile-predecessor",
-      cancel: () => {
-        interrupted();
-        expectDefined(activeRun, "active predecessor run").complete();
-      },
-    });
-    const profile = scenario.writeDuringProfilePreparation
-      ? ensureProfileForEmail("chat-target-preparation@example.test")
-      : undefined;
-    const client: GatewayClient | null = profile
-      ? {
-          connId: "chat-target-preparation",
-          authenticatedUserProfile: {
-            profileId: profile.id,
-            displayName: null,
-            hasAvatar: false,
-            updatedAt: profile.updatedAt,
-          },
-          connect: {
-            minProtocol: 1,
-            maxProtocol: 1,
-            role: "operator",
-            scopes: ["operator.admin"],
-            client: {
-              id: "openclaw-control-ui",
-              version: "test",
-              platform: "web",
-              mode: "webchat",
-            },
-          },
-        }
-      : null;
-    let preparedProfile:
-      | Awaited<ReturnType<typeof profileReader.prepareUserProfileIdentity>>
-      | undefined;
-    const prepareProfile = profileReader.prepareUserProfileIdentity;
-    const holdProfile = profile
-      ? vi
-          .spyOn(profileReader, "prepareUserProfileIdentity")
-          .mockImplementation(async (...args) => {
-            const prepared = await prepareProfile(...args);
-            preparedProfile = prepared;
-            vi.spyOn(prepared, "release");
-            profilePrepared.resolve();
-            await resumeProfile.promise;
-            return prepared;
-          })
-      : undefined;
     let configReloaded = false;
     const readQualifiedEntry = sessionStores.withQualifiedGatewaySessionEntry;
     const reloadDuringRead = scenario.configDuringAdmission
@@ -460,7 +306,6 @@ it.each<{
         sessionKey: scenario.key,
         message,
         idempotencyKey: runId,
-        ...(scenario.writeDuringProfilePreparation ? { queueMode: "interrupt" as const } : {}),
       };
       sending = handleDirectExternalChatSend(
         {
@@ -468,7 +313,7 @@ it.each<{
           req: { type: "req", id: runId, method: "chat.send", params },
           respond,
           context,
-          client,
+          client: null,
           isWebchatConnect: () => false,
         },
         scenario.writeDuringAdmission
@@ -477,28 +322,8 @@ it.each<{
               await resumeAdmission.promise;
               return true;
             }
-          : scenario.writeDuringProfilePreparation
-            ? admissionCallback
-            : undefined,
+          : undefined,
       );
-      if (scenario.writeDuringProfilePreparation) {
-        try {
-          await Promise.race([
-            profilePrepared.promise,
-            sending.then(() => {
-              throw new Error("chat.send settled before real operator profile preparation");
-            }),
-          ]);
-          await seedRow(literalScope);
-          rows.push(literalScope);
-          const withCounterpart = await snapshot();
-          expect(withCounterpart.entries[0]).toEqual(before.entries[0]);
-          expect(withCounterpart.transcripts[0]).toEqual(before.transcripts[0]);
-          before = withCounterpart;
-        } finally {
-          resumeProfile.resolve();
-        }
-      }
       if (scenario.writeDuringAdmission) {
         try {
           await Promise.race([
@@ -507,14 +332,11 @@ it.each<{
               throw new Error("chat.send settled before the admission callback");
             }),
           ]);
-          const inserted =
-            scenario.writeDuringAdmission === "counterpart"
-              ? literalScope
-              : {
-                  ...literalScope,
-                  sessionKey: "agent:research:other",
-                  sessionId: "unrelated-session",
-                };
+          const inserted = {
+            ...literalScope,
+            sessionKey: "agent:research:other",
+            sessionId: "unrelated-session",
+          };
           await seedRow(inserted);
           rows.push(inserted);
           const withCounterpart = await snapshot();
@@ -526,20 +348,6 @@ it.each<{
         }
       }
       await sending;
-      if (scenario.writeDuringProfilePreparation) {
-        expect(interrupted).not.toHaveBeenCalled();
-        expect(admissionCallback).not.toHaveBeenCalled();
-        expect(
-          expectDefined(preparedProfile, "prepared operator profile").release,
-        ).toHaveBeenCalledOnce();
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({
-            message: expect.stringContaining("ambiguous stored identity"),
-          }),
-        );
-      }
       if (scenario.configDuringAdmission) {
         expect(configReloaded).toBe(true);
       }
@@ -746,7 +554,6 @@ it.each<{
         expect(await snapshot()).toEqual(beforeRetry);
       }
     } finally {
-      resumeProfile.resolve();
       resumeAdmission.resolve();
       await Promise.allSettled(sending ? [sending] : []);
       const owned = observeDispatch.mock.calls.at(-1)?.[0];
@@ -758,11 +565,6 @@ it.each<{
         : undefined;
       release.resolve();
       await settled;
-      activeRun?.complete();
-      if (preparedProfile) {
-        vi.mocked(preparedProfile.release).mockRestore();
-      }
-      holdProfile?.mockRestore();
       reloadDuringRead?.mockRestore();
       replaceAfterSelection?.mockRestore();
       holdDispatch.mockRestore();

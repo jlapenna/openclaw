@@ -1,24 +1,25 @@
-import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { EmbeddedForegroundPromptContext } from "../../agents/embedded-agent-runner/run/params.js";
+import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { getCanonicalSkillWorkspace } from "../../agents/skill-workshop-workspace-context.js";
-import { canonicalizePath } from "../../agents/utils/paths.js";
 import { isInternalSessionEffectsKey } from "../../config/sessions/internal-session-key.js";
 import type { TranscriptEntryAnchor } from "../../config/sessions/transcript-entry-anchor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { pruneMapToMaxSize } from "../../infra/map-size.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { isExpectedRunCancellation } from "../../process/expected-run-cancellation.js";
 import { isIncognitoSessionKey } from "../../routing/session-key.js";
 import { runInDetachedAsyncContext } from "../../shared/detached-async-context.js";
 import type { RunSkillUsage } from "../runtime/run-usage.js";
 import { resolveSkillWorkshopConfig } from "./config.js";
-import { resolveWorkshopSkillsDir } from "./skills-root.js";
 
 /** Model iterations a session accumulates across turns before a review is due. */
 const EXPERIENCE_REVIEW_ITERATION_THRESHOLD = 10;
 const EXPERIENCE_REVIEW_IDLE_MS = 30_000;
 const EXPERIENCE_REVIEW_RETRY_IDLE_MS = 30_000;
+const EXPERIENCE_REVIEW_RATE_LIMIT_BACKOFF_MS = 15 * 60_000;
+const EXPERIENCE_REVIEW_MAX_BACKOFF_MS = 60 * 60_000;
 const EXPERIENCE_REVIEW_MAX_PENDING = 32;
 const EXPERIENCE_REVIEW_MAX_COUNTERS = 1024;
 const EXPERIENCE_REVIEW_BLOCKED_TRIGGERS = new Set(["cron", "heartbeat", "memory", "overflow"]);
@@ -81,7 +82,6 @@ type ExperienceReviewSchedulerDeps = {
 
 type PendingExperienceReview = {
   candidate: ExperienceReviewCandidate;
-  generation: number;
   timer?: ExperienceReviewTimer;
 };
 
@@ -133,27 +133,31 @@ function resolveTurnModelIterations(params: SkillExperienceReviewParams): number
   return count;
 }
 
-/** A learned skill the turn read or viewed; its outcome is fresh evidence for that skill. */
-function usedWorkshopSkill(params: SkillExperienceReviewParams): boolean {
-  if (!params.usedSkills?.length) {
-    return false;
-  }
-  const root = canonicalizePath(
-    resolveWorkshopSkillsDir(params.config, params.ctx.foregroundPromptContext.agentId),
-  );
-  return params.usedSkills.some((skill) => skill.skillFile?.startsWith(`${root}${path.sep}`));
-}
-
 /**
  * Counts model iterations per (agent, session) across turns and queues one background review
- * once a session has done enough work since its last review or its last own Workshop edit,
- * or right after a turn that used a learned skill. Reviews wait for a quiet period and run
- * one at a time.
+ * after 10 iterations since its last queued review or its last own Workshop edit.
+ * Reviews wait for a quiet period and run one at a time.
  */
 export function createSkillExperienceReviewScheduler(deps: ExperienceReviewSchedulerDeps) {
   const iterationsBySession = new Map<string, number>();
   const pendingBySession = new Map<string, PendingExperienceReview>();
   let reviewInFlight = false;
+  let cooldownUntil = 0;
+  let rateLimitBackoffMs = 0;
+  const deferForRateLimit = () => {
+    // One saturated organization can affect every agent/model. Do not let the
+    // next queued session replace the failed review with another paid attempt.
+    const now = Date.now();
+    if (now < cooldownUntil) {
+      cooldownUntil = now + rateLimitBackoffMs;
+      return;
+    }
+    rateLimitBackoffMs = Math.min(
+      EXPERIENCE_REVIEW_MAX_BACKOFF_MS,
+      rateLimitBackoffMs * 2 || EXPERIENCE_REVIEW_RATE_LIMIT_BACKOFF_MS,
+    );
+    cooldownUntil = now + rateLimitBackoffMs;
+  };
   const setTimer = deps.setTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
   const clearTimer = deps.clearTimer ?? clearTimeout;
 
@@ -161,31 +165,44 @@ export function createSkillExperienceReviewScheduler(deps: ExperienceReviewSched
     if (pending.timer) {
       clearTimer(pending.timer);
     }
-    const generation = ++pending.generation;
     const timerCallback = () => {
-      if (pendingBySession.get(key) !== pending || pending.generation !== generation) {
+      if (pendingBySession.get(key) !== pending) {
         return;
       }
       pending.timer = undefined;
       void (async () => {
         const active = await deps.isSystemActive();
-        if (pendingBySession.get(key) !== pending || pending.generation !== generation) {
+        if (pendingBySession.get(key) !== pending) {
           return;
         }
-        if (active || reviewInFlight) {
-          arm(key, pending, EXPERIENCE_REVIEW_RETRY_IDLE_MS);
+        const cooldownRemaining = cooldownUntil - Date.now();
+        if (active || reviewInFlight || cooldownRemaining > 0) {
+          arm(key, pending, Math.max(EXPERIENCE_REVIEW_RETRY_IDLE_MS, cooldownRemaining));
           return;
         }
         reviewInFlight = true;
         try {
           pendingBySession.delete(key);
           await deps.runReview(pending.candidate);
+          rateLimitBackoffMs = 0;
+        } catch (error) {
+          if (resolveFailoverReasonFromError(error) === "rate_limit") {
+            deferForRateLimit();
+          }
+          throw error;
         } finally {
           reviewInFlight = false;
         }
       })().catch((error: unknown) => {
-        log.warn(`skill experience review failed: ${formatErrorMessage(error)}`);
-        if (pendingBySession.get(key) === pending && pending.generation === generation) {
+        if (
+          isExpectedRunCancellation(error) ||
+          (error instanceof Error && error.name === "AbortError")
+        ) {
+          log.debug(`skill experience review cancelled: ${formatErrorMessage(error)}`);
+        } else {
+          log.warn(`skill experience review failed: ${formatErrorMessage(error)}`);
+        }
+        if (pendingBySession.get(key) === pending) {
           pendingBySession.delete(key);
         }
       });
@@ -226,6 +243,9 @@ export function createSkillExperienceReviewScheduler(deps: ExperienceReviewSched
       // Errored completions (provider/prompt failures) are environment noise, not
       // learnable evidence. User aborts carry no error and stay eligible.
       if (typeof params.event.error === "string" && params.event.error.trim() !== "") {
+        if (resolveFailoverReasonFromError(new Error(params.event.error)) === "rate_limit") {
+          deferForRateLimit();
+        }
         log.debug(`experience review skipped: reason=errored-completion session=${sessionKey}`);
         return;
       }
@@ -244,7 +264,7 @@ export function createSkillExperienceReviewScheduler(deps: ExperienceReviewSched
       }
       const iterations = (iterationsBySession.get(key) ?? 0) + resolveTurnModelIterations(params);
       iterationsBySession.delete(key);
-      if (iterations < EXPERIENCE_REVIEW_ITERATION_THRESHOLD && !usedWorkshopSkill(params)) {
+      if (iterations < EXPERIENCE_REVIEW_ITERATION_THRESHOLD) {
         // Re-insert so the least recently active session is the one pruned.
         iterationsBySession.set(key, iterations);
         pruneMapToMaxSize(iterationsBySession, EXPERIENCE_REVIEW_MAX_COUNTERS);
@@ -281,20 +301,11 @@ export function createSkillExperienceReviewScheduler(deps: ExperienceReviewSched
         usedSkills: params.usedSkills ? [...params.usedSkills] : undefined,
         turnAborted: !params.event.success,
       };
-      const pending = existing ?? { candidate, generation: 0 };
+      const pending = existing ?? { candidate };
       pending.candidate = candidate;
       pendingBySession.set(key, pending);
       arm(key, pending, EXPERIENCE_REVIEW_IDLE_MS);
       log.debug(`experience review scheduled: session=${sessionKey} iterations=${iterations}`);
-    },
-    clear(): void {
-      for (const pending of pendingBySession.values()) {
-        if (pending.timer) {
-          clearTimer(pending.timer);
-        }
-      }
-      pendingBySession.clear();
-      iterationsBySession.clear();
     },
   };
 }

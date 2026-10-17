@@ -1,6 +1,8 @@
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import { captureRuntimeConfigAsyncReader } from "../../config/io.js";
+import { clearRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { buildRestartRecoveryClaimCleanupPatch } from "../../config/sessions/restart-recovery-state.js";
 import {
   appendTranscriptMessage,
@@ -8,6 +10,10 @@ import {
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions/types.js";
+import {
+  abortActiveCronTaskRuns,
+  registerActiveCronTaskRun,
+} from "../../cron/service/active-run-cancellation.js";
 import { callGateway } from "../../gateway/call.js";
 import { buildRestartSafeChatTranscriptState } from "../../gateway/server-methods/chat-restart-recovery.js";
 import { prepareGatewayStartupSessions } from "../../gateway/server-startup-session-migration.js";
@@ -22,7 +28,10 @@ import {
 } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { finishAgentCommandCleanup } from "../command/cleanup.js";
-import { createAgentRunRestartAbortError } from "../run-termination.js";
+import {
+  createAgentRunRestartAbortError,
+  resolveAgentRunErrorLifecycleFields,
+} from "../run-termination.js";
 import { createRecoveryRuntimeFixture } from "./main-session-recovery-runtime.test-support.js";
 import { mainSessionRecoveryLog } from "./main-session-restart-recovery-shared.js";
 import {
@@ -41,13 +50,16 @@ vi.mock("../../gateway/call.js", async (importOriginal) => ({
   callGateway: vi.fn(async () => ({ runId: "resumed-chat-run" })),
 }));
 
+afterEach(() => {
+  clearRuntimeConfigSnapshot();
+});
+
 async function migrateLegacyInterruption(sessionKey: string, stateDir: string) {
   const { db } = openOpenClawAgentDatabase({ agentId: "main" });
-  // Restore the previous writer's certified bytes; current writers accept outcomes only.
+  // Retain certification with legacy bytes; startup must still normalize them.
   db.prepare(
-    "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.status', 'running') WHERE session_key = ?",
+    "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.status', 'running'), entry_valid = 1 WHERE session_key = ?",
   ).run(sessionKey);
-  db.prepare("UPDATE session_nodes SET entry_valid = 1 WHERE session_key = ?").run(sessionKey);
   await closeOpenClawAgentDatabasesAsync(stateDir);
   await prepareGatewayStartupSessions({
     cfg: { agents: { entries: { main: {} } } },
@@ -60,8 +72,11 @@ it.each([
   "after settlement",
   "persisted interruption",
   "unclaimed legacy",
+  "automation drain",
 ] as const)("resumes restart-safe work across shutdown and upgrade (%s)", async (order) => {
   await withOpenClawTestState({ label: "restart-aborted-chat" }, async (state) => {
+    await captureRuntimeConfigAsyncReader()();
+    const automationDrain = order === "automation drain";
     const sessionKey = "agent:main:dashboard:restart-chat";
     const sessionId = "restart-chat-session";
     const runId = "interrupted-chat-run";
@@ -123,14 +138,31 @@ it.each([
         activeRuns: [{ sessionKey, sessionId, runId, lifecycleGeneration }],
         isActiveRun: () => isActive,
       });
-    if (order === "before settlement" || order === "after settlement") {
+    if (order === "before settlement" || order === "after settlement" || automationDrain) {
       if (order === "before settlement") {
         await mark(true);
       }
-      const error = createAgentRunRestartAbortError();
+      const controller = new AbortController();
+      if (automationDrain) {
+        const release = registerActiveCronTaskRun({ runId, controller });
+        try {
+          expect(abortActiveCronTaskRuns()).toBe(1);
+        } finally {
+          release?.();
+        }
+      }
+      const error = automationDrain
+        ? new Error("Provider request cancelled during drain")
+        : createAgentRunRestartAbortError();
+      const abortSignal = automationDrain ? controller.signal : undefined;
+      const terminalData = {
+        phase: "error",
+        error,
+        ...resolveAgentRunErrorLifecycleFields(error, abortSignal),
+      };
       // The command's finally can finish before the Gateway's queued lifecycle
       // publication and shutdown discovery; its outer signal need not be aborted.
-      const cleanup = {
+      await finishAgentCommandCleanup({
         prepared: {
           ...target,
           sessionAgentId: "main",
@@ -141,7 +173,8 @@ it.each([
         runOwnedSessionId: sessionId,
         sessionReboundDuringRun: false,
         trackedRestartRecoveryDeliveryClaim: true,
-        terminalEvent: { data: { phase: "error", error, stopReason: "restart" } },
+        terminalEvent: { data: terminalData },
+        abortSignal,
         lifecycleGeneration,
         beforeTerminalDelivery: undefined,
         reportCommitted: () => {},
@@ -149,8 +182,7 @@ it.each([
         sessionWorkAdmission: undefined,
         cleanupInternalModelRunTargets: async () => {},
         releaseForeground: undefined,
-      };
-      await finishAgentCommandCleanup(cleanup);
+      });
       await persistGatewaySessionLifecycleEvent({
         sessionKey,
         event: {
@@ -158,10 +190,13 @@ it.each([
           sessionId,
           lifecycleGeneration,
           ts: 200,
-          data: { phase: "error", error, aborted: true, stopReason: "restart" },
+          // Shutdown may publish the embedded owner's restart after caller cleanup.
+          data: automationDrain
+            ? { ...terminalData, aborted: true, stopReason: "restart" }
+            : terminalData,
         },
       });
-      if (order === "after settlement") {
+      if (order === "after settlement" || automationDrain) {
         expect(await mark(false)).toEqual({ marked: 0, skipped: 0 });
       }
       const interrupted = loadSessionEntry(target);
@@ -183,6 +218,12 @@ it.each([
       getDispatchSettlement: () => dispatchSettlement.promise,
       sendRecoveryNotice: vi.fn(async () => ({ suppressed: false })),
     });
+    const recover = (activeSessionIds?: string[]) =>
+      recoverRestartAbortedMainSessions({
+        stateDir: state.stateDir,
+        gatewayRuntime: runtime,
+        ...(activeSessionIds ? { activeSessionIds } : {}),
+      });
     try {
       if (order === "persisted interruption") {
         const info = vi.spyOn(mainSessionRecoveryLog, "info");
@@ -191,13 +232,12 @@ it.each([
             stateDir: state.stateDir,
             activeSessionIds: [sessionId],
           });
-          expect(
-            await recoverRestartAbortedMainSessions({
-              stateDir: state.stateDir,
-              activeSessionIds: [sessionId],
-              gatewayRuntime: runtime,
-            }),
-          ).toEqual({ started: 0, settled: 0, failed: 0, skipped: 1 });
+          expect(await recover([sessionId])).toEqual({
+            started: 0,
+            settled: 0,
+            failed: 0,
+            skipped: 1,
+          });
           expect(dispatch).not.toHaveBeenCalled();
           expect(loadSessionEntry(target)?.restartRecoveryTerminalRunIds).toEqual([
             "previous-completed-run",
@@ -212,10 +252,7 @@ it.each([
         }
       }
       await markStartupOrphanedMainSessionsForRecovery({ stateDir: state.stateDir });
-      const result = await recoverRestartAbortedMainSessions({
-        stateDir: state.stateDir,
-        gatewayRuntime: runtime,
-      });
+      const result = await recover();
       expect(result).toMatchObject({ started: 1, failed: 0, skipped: 0 });
       expect(dispatch).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -233,6 +270,10 @@ it.each([
         mainRestartRecovery: expect.objectContaining({ chargedAttempts: 1 }),
       });
       expect(loadSessionEntry(target)?.restartRecoveryTerminalRunIds ?? []).not.toContain(runId);
+      if (automationDrain) {
+        expect(await recover()).toMatchObject({ started: 0, failed: 0 });
+        expect(dispatch).toHaveBeenCalledTimes(1);
+      }
       if (order === "persisted interruption") {
         expect(loadSessionEntry(target)?.restartRecoveryTerminalRunIds).toEqual([
           "previous-completed-run",
@@ -246,6 +287,7 @@ it.each([
 
 it("preserves a terminal receipt recorded under the interrupted continuation's source", async () => {
   await withOpenClawTestState({ label: "restart-terminal-receipt" }, async (state) => {
+    await captureRuntimeConfigAsyncReader()();
     const sessionKey = "agent:main:dashboard:delivered-chat";
     const sessionId = "delivered-chat-session";
     const runId = "interrupted-continuation";

@@ -2,7 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -11,14 +11,15 @@ import {
 import { withEnvAsync } from "../test-utils/env.js";
 import { withExecutor } from "./config-executor.test-support.js";
 import { createConfigIO, writeConfigFile } from "./io.js";
+import * as configWriteSafety from "./io.write-safety.js";
 import {
-  mutateConfigFile,
   mutateConfigFileWithRetry,
   replaceConfigFile,
   resolveConfigIncludeWriteBoundary,
   transformConfigFileWithRetry,
   withConfigMutationExclusive,
 } from "./mutate.js";
+import { composeConfigWriteAssertions } from "./write-authority.js";
 import { withConfigWriteLock } from "./write-lock.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
@@ -38,7 +39,66 @@ function deferred() {
 }
 
 describe("direct config writer exclusion", () => {
-  it.each(["replace", "snapshot", "mutate", "retry"] as const)(
+  it.each(["root", "include"] as const)(
+    "rechecks requester admission after asynchronous preparation of a %s write",
+    async (target) => {
+      const stateDir = tempDirs.make("openclaw-config-publication-admission-");
+      const configPath = path.join(stateDir, "openclaw.json");
+      const includePath = path.join(stateDir, "gateway.json5");
+      const gatewayRaw = '{"mode":"local","port":18789}\n';
+      const rootRaw =
+        target === "include"
+          ? '{"gateway":{"$include":"./gateway.json5"}}\n'
+          : `{"gateway":${gatewayRaw.trim()}}\n`;
+      const writtenPath = target === "include" ? includePath : configPath;
+      await fs.writeFile(configPath, rootRaw);
+      if (target === "include") {
+        await fs.writeFile(includePath, gatewayRaw);
+      }
+      await fs.writeFile(`${writtenPath}.bak`, "retained backup\n");
+      await withEnvAsync(
+        { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_CONFIG_PATH: configPath },
+        async () => {
+          const io = createConfigIO({ observe: false, pluginValidation: "skip" });
+          const { snapshot, writeOptions } = await io.readConfigFileSnapshotForWrite();
+          const sourceConfig = structuredClone(snapshot.sourceConfig);
+          sourceConfig.gateway = { ...sourceConfig.gateway, port: 19001 };
+          let current = true;
+          const assertBeforePublish = vi.fn(() => {
+            if (!current) {
+              throw new Error("requester revoked before publication");
+            }
+          });
+          await expect(
+            replaceConfigFile({
+              snapshot,
+              sourceConfig,
+              writeOptions: {
+                ...writeOptions,
+                observe: false,
+                skipPluginValidation: true,
+                skipRuntimeSnapshotRefresh: true,
+                beforeCommit: async () => {
+                  await Promise.resolve();
+                  current = false;
+                },
+                assertBeforePublish,
+              },
+            }),
+          ).rejects.toThrow("requester revoked before publication");
+          expect(assertBeforePublish).toHaveBeenCalledOnce();
+          expect(await fs.readFile(configPath, "utf8")).toBe(rootRaw);
+          expect(await fs.readFile(writtenPath, "utf8")).toBe(
+            target === "include" ? gatewayRaw : rootRaw,
+          );
+          expect(await fs.readFile(`${writtenPath}.bak`, "utf8")).toBe("retained backup\n");
+          await expect(fs.stat(`${writtenPath}.bak.1`)).rejects.toMatchObject({ code: "ENOENT" });
+        },
+      );
+    },
+  );
+
+  it.each(["snapshot", "retry"] as const)(
     "rejects changed %s path provenance before creating the canonical lock directory",
     async (flow) => {
       const stateDir = tempDirs.make("openclaw-config-revoked-admission-");
@@ -58,13 +118,13 @@ describe("direct config writer exclusion", () => {
           };
           const nextConfig = { gateway: { mode: "local" as const, port: 19001 } };
           const mutation =
-            flow === "replace" || flow === "snapshot"
+            flow === "snapshot"
               ? replaceConfigFile({
-                  ...(flow === "snapshot" ? { snapshot } : {}),
+                  snapshot,
                   writeOptions: options,
                   nextConfig,
                 })
-              : (flow === "retry" ? mutateConfigFileWithRetry : mutateConfigFile)({
+              : mutateConfigFileWithRetry({
                   writeOptions: options,
                   mutate: (draft) => {
                     draft.gateway = nextConfig.gateway;
@@ -90,39 +150,63 @@ describe("direct config writer exclusion", () => {
         const io = createConfigIO({ env, observe: false, pluginValidation: "skip" });
         const { writeOptions } = await io.readConfigFileSnapshotForWrite();
         let attempts = 0;
+        const sharedGuardCalls: number[] = [];
+        const guardFactory = vi.spyOn(configWriteSafety, "createConfigFileWriteGuard");
 
-        await withExecutor(stateDir, "config-lock-fence", async (assertCurrent, revoke) => {
-          await expect(
-            transformConfigFileWithRetry({
-              maxAttempts: 2,
-              writeOptions: {
-                ...writeOptions,
-                assertCurrent,
-                observe: false,
-                skipPluginValidation: true,
-                skipRuntimeSnapshotRefresh: true,
-              },
-              transform: async (config, { attempt }) => {
-                attempts += 1;
-                if (attempt === 0) {
-                  await fs.writeFile(configPath, concurrentRaw);
-                } else {
-                  await io.writeConfigFile(
-                    { gateway: { mode: "local", port: 19003 } },
-                    {
-                      preCommitRuntimePreflight: async () => {
-                        revoke();
+        try {
+          await withExecutor(stateDir, "config-lock-fence", async (assertCurrent, revoke) => {
+            const sharedAuthority = vi.fn(assertCurrent);
+            await expect(
+              transformConfigFileWithRetry({
+                maxAttempts: 2,
+                writeOptions: {
+                  ...writeOptions,
+                  assertCurrent: sharedAuthority,
+                  observe: false,
+                  skipPluginValidation: true,
+                  skipRuntimeSnapshotRefresh: true,
+                },
+                transform: async (config, { attempt }) => {
+                  attempts += 1;
+                  if (attempt === 0) {
+                    await fs.writeFile(configPath, concurrentRaw);
+                  } else {
+                    await replaceConfigFile({
+                      io,
+                      nextConfig: { gateway: { mode: "local", port: 19003 } },
+                      writeOptions: {
+                        ...writeOptions,
+                        assertConfigPathForWrite: composeConfigWriteAssertions(
+                          writeOptions.assertConfigPathForWrite,
+                          sharedAuthority,
+                        ),
+                        beforeCommit: async () => {
+                          const publicationGuard = guardFactory.mock.lastCall?.[2];
+                          if (!publicationGuard) {
+                            throw new Error("Missing config publication guard");
+                          }
+                          sharedAuthority.mockClear();
+                          publicationGuard();
+                          sharedGuardCalls.push(sharedAuthority.mock.calls.length);
+                          await Promise.resolve();
+                          publicationGuard();
+                          sharedGuardCalls.push(sharedAuthority.mock.calls.length);
+                          revoke();
+                        },
                       },
-                    },
-                  );
-                }
-                return { nextConfig: { ...config, gateway: { mode: "local", port: 19001 } } };
-              },
-            }),
-          ).rejects.toThrow(/executor ownership is no longer current|source ownership changed/);
-        });
+                    });
+                  }
+                  return { nextConfig: { ...config, gateway: { mode: "local", port: 19001 } } };
+                },
+              }),
+            ).rejects.toThrow(/executor ownership is no longer current|source ownership changed/);
+          });
+        } finally {
+          guardFactory.mockRestore();
+        }
 
         expect(attempts).toBe(2);
+        expect(sharedGuardCalls).toEqual([1, 2]);
         expect(await fs.readFile(configPath, "utf8")).toBe(concurrentRaw);
         await expect(fs.stat(`${configPath}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
       },

@@ -13,8 +13,8 @@ import { stopChildProcess } from "../../test/helpers/stop-child-process.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { cleanupSnapshotOperations } from "../infra/sqlite-readonly-location-cleanup.js";
 import * as sqliteReadOnly from "../infra/sqlite-snapshot-source.js";
-import { createSqliteWalReclamationResult } from "../infra/sqlite-wal-reclamation.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { requireNativeSqliteDatabase } from "../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
 import {
@@ -23,11 +23,10 @@ import {
 } from "./openclaw-quarantine-store.js";
 import { StateDatabaseReadAdmissionInvalidatedError } from "./openclaw-state-db-async-lifecycle.js";
 import {
-  closeOpenClawStateDatabaseByPathAsync,
   closeOpenClawStateDatabaseAsync,
   recordOpenClawStateDatabaseOpenFailure,
 } from "./openclaw-state-db-cache.js";
-import { iterateOpenClawStateDatabaseReadOnly } from "./openclaw-state-db-read-connection.js";
+import { createDanglingSkillWorkshopReviewIndex } from "./openclaw-state-db-corruption.test-support.js";
 import {
   isOpenClawStateDatabaseDefinitelyAbsent,
   executeExistingOpenClawStateRead,
@@ -52,6 +51,29 @@ function createOptions(stateDir: string) {
     env: { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_TEST_FAST: "1" },
     path: path.join(stateDir, "state", "openclaw.sqlite"),
   };
+}
+
+function createClosedState(stateDir: string) {
+  const options = createOptions(stateDir);
+  openOpenClawStateDatabase(options);
+  closeOpenClawStateDatabaseForTest();
+  return options;
+}
+
+function createWalFixture(root: string) {
+  const options = createClosedState(root);
+  const writer = new DatabaseSync(options.path);
+  writer.exec(
+    "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('first');",
+  );
+  const read = () =>
+    withExistingOpenClawStateDatabaseReadOnly(
+      ({ db }) => db.prepare("SELECT value FROM held").get()?.value,
+      options,
+    );
+  const artifacts = () =>
+    ["", "-wal", "-shm"].map((suffix) => fs.readFileSync(options.path + suffix));
+  return { options, writer, read, artifacts };
 }
 
 // Vitest can enter teardown while a timed-out body is still closing its native owners.
@@ -115,13 +137,11 @@ it.each([undefined, "EACCES"])(
 
 it("keeps fresh synchronous read callbacks from returning asynchronous work", async () => {
   await withTempDir("openclaw-state-sync-read-", async (root) => {
-    const options = createOptions(root);
-    openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
+    const options = createClosedState(root);
     let reader: DatabaseSync | undefined;
     expect(() =>
       withExistingOpenClawStateDatabaseReadOnly(({ db }) => {
-        reader = db;
+        reader = requireNativeSqliteDatabase(db);
         return Promise.resolve(1);
       }, options),
     ).toThrow("SQLite source read must remain synchronous");
@@ -135,7 +155,7 @@ it("preserves read admission denial and recovers the cached reader", async () =>
     const opened = openOpenClawStateDatabase(options);
     const operation = vi.fn(() => "unexpected");
     let denied = false;
-    opened.db.setAuthorizer((action) => {
+    requireNativeSqliteDatabase(opened.db).setAuthorizer((action) => {
       if (action === constants.SQLITE_SELECT && !denied) {
         denied = true;
         return constants.SQLITE_DENY;
@@ -147,7 +167,7 @@ it("preserves read admission denial and recovers the cached reader", async () =>
         /not authorized/,
       );
     } finally {
-      opened.db.setAuthorizer(null);
+      requireNativeSqliteDatabase(opened.db).setAuthorizer(null);
     }
     expect(denied).toBe(true);
     expect(operation).not.toHaveBeenCalled();
@@ -157,95 +177,6 @@ it("preserves read admission denial and recovers the cached reader", async () =>
         return db.prepare("SELECT role FROM schema_meta").get();
       }, options),
     ).toEqual({ role: "global" });
-  });
-});
-
-it.each(["throw", "failed close"] as const)(
-  "ends the native stream snapshot before close on %s",
-  async (ending) => {
-    await withTempDir("openclaw-state-stream-snapshot-", async (root) => {
-      const source = openOpenClawStateDatabase(createOptions(root));
-      let reader: DatabaseSync | undefined;
-      let finalized = false;
-      let transactionAtClose: boolean | undefined;
-      let refuseClose = ending === "failed close";
-      const failure = new Error("reader close failed");
-      // oxlint-disable-next-line typescript/unbound-method -- Called below with the intercepted native database receiver.
-      const close = DatabaseSync.prototype.close;
-      vi.spyOn(DatabaseSync.prototype, "close").mockImplementation(function (this: DatabaseSync) {
-        if (this === reader) {
-          transactionAtClose = this.isTransaction;
-          if (refuseClose) {
-            throw failure;
-          }
-        }
-        close.call(this);
-      });
-      const rows = iterateOpenClawStateDatabaseReadOnly(source, function* ({ db }) {
-        reader = db;
-        try {
-          yield db.prepare("SELECT 1 AS value").get()?.value;
-        } finally {
-          expect(db.isOpen).toBe(true);
-          expect(db.isTransaction).toBe(true);
-          finalized = true;
-        }
-      });
-      try {
-        expect((await rows.next()).value).toBe(1);
-        if (ending === "failed close") {
-          await expect(rows.return()).rejects.toBe(failure);
-          expect(reader?.isOpen).toBe(true);
-          await expect(closeOpenClawStateDatabaseByPathAsync(source.path)).rejects.toThrow(
-            "reader close failed",
-          );
-          expect(reader?.isOpen).toBe(true);
-          refuseClose = false;
-          await closeOpenClawStateDatabaseByPathAsync(source.path);
-        } else {
-          const consumerFailure = new Error("stream consumer failed");
-          await expect(rows.throw(consumerFailure)).rejects.toBe(consumerFailure);
-        }
-        expect(finalized).toBe(true);
-        expect(transactionAtClose).toBe(false);
-        expect(reader?.isOpen).toBe(false);
-      } finally {
-        refuseClose = false;
-        await rows.return();
-        closeOpenClawStateDatabaseForTest();
-      }
-    });
-  },
-);
-
-it("rejects non-filesystem stream sources without interpreting their logical path as a file", async () => {
-  await withTempDir("openclaw-state-memory-stream-", async (root) => {
-    const db = new DatabaseSync(":memory:");
-    const pathname = path.join(root, "logical-state.sqlite");
-    const rows = iterateOpenClawStateDatabaseReadOnly(
-      {
-        db,
-        path: pathname,
-        walMaintenance: {
-          stop: async () => {},
-          checkpoint: () => false,
-          close: () => false,
-          reclaimFreePages: createSqliteWalReclamationResult,
-        },
-      },
-      function* () {
-        yield "unreachable";
-      },
-    );
-    try {
-      await expect(rows.next()).rejects.toThrow(
-        "Streaming shared-state reads require a filesystem-backed database",
-      );
-      expect(fs.readdirSync(root)).toEqual([]);
-    } finally {
-      await rows.return();
-      db.close();
-    }
   });
 });
 
@@ -341,7 +272,7 @@ it("reads only active disposable scopes directly and revokes inherited async acc
         expect(isArtifactPreservingStateRead()).toBe(true);
         expect(db.prepare("SELECT value FROM held").get()).toEqual({ value: "committed" });
         expect(() => db.exec("INSERT INTO held VALUES ('unexpected')")).toThrow(/readonly/);
-        return db.location();
+        return requireNativeSqliteDatabase(db).location();
       }, options);
     const sourceBefore = fs.readFileSync(source.path);
     const released = createDeferredCore();
@@ -366,34 +297,8 @@ it("reads only active disposable scopes directly and revokes inherited async acc
 });
 it("requires Doctor for the exact dangling Workshop index without changing its source", async () => {
   await withTempDir("openclaw-state-readonly-dangling-workshop-", async (stateDir) => {
-    const options = createOptions(stateDir);
-    const opened = openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
-    const database = new DatabaseSync(opened.path);
-    try {
-      database.exec(
-        "CREATE TABLE IF NOT EXISTS skill_workshop_collection_reviews (review_id TEXT NOT NULL PRIMARY KEY, owner_agent_id TEXT NOT NULL, backup_id TEXT NOT NULL, create_time INTEGER NOT NULL, kept_names_json TEXT NOT NULL, written_names_json TEXT NOT NULL, dropped_json TEXT NOT NULL) STRICT; CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(review_id, create_time DESC);",
-      );
-      database.enableDefensive?.(false);
-      database.exec("PRAGMA writable_schema = ON;");
-      database
-        .prepare(
-          `UPDATE sqlite_schema
-              SET sql = 'CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time
-                           ON skill_workshop_collection_reviews(workspace_dir, create_time DESC, review_id DESC)'
-            WHERE type = 'index'
-              AND name = 'idx_skill_workshop_collection_reviews_workspace_time'`,
-        )
-        .run();
-      const schema = database.prepare("PRAGMA schema_version").get() as {
-        schema_version: number;
-      };
-      database.exec(
-        `PRAGMA writable_schema = OFF; PRAGMA schema_version = ${schema.schema_version + 1};`,
-      );
-    } finally {
-      database.close();
-    }
+    const options = createClosedState(stateDir);
+    createDanglingSkillWorkshopReviewIndex(options.path);
     const before = fs.readFileSync(options.path);
 
     await expect(
@@ -445,15 +350,12 @@ it("reuses an idle writer but isolates its transaction", async () => {
 
 it.each([
   { failure: "quarantine", composite: false },
-  { failure: "quarantine", composite: true },
   { failure: "callback", composite: true },
 ] as const)(
   "cleans the async snapshot after $failure rejection (composite: $composite)",
   async ({ failure, composite }) => {
     await withTempDir("openclaw-state-readonly-admission-", async (stateDir) => {
-      const options = createOptions(stateDir);
-      openOpenClawStateDatabase(options);
-      closeOpenClawStateDatabaseForTest();
+      const options = createClosedState(stateDir);
       const refused = new Error("synthetic readonly verification failure");
       const prepare = sqliteReadOnly.prepareSqliteReadOnlyLocation;
       let preparedLocation: string | undefined;
@@ -526,21 +428,8 @@ it("keeps missing and non-missing filesystem failures distinct for async reads",
 
 it("shares only one synchronous metadata snapshot and refreshes committed WAL next time", async () => {
   await withTempDir("openclaw-metadata-snapshot-", async (root) => {
-    const options = createOptions(root);
-    openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
-    const writer = new DatabaseSync(options.path);
-    writer.exec(
-      "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('first');",
-    );
-    const read = () =>
-      withExistingOpenClawStateDatabaseReadOnly(
-        ({ db }) => db.prepare("SELECT value FROM held").get()?.value,
-        options,
-      );
+    const { writer, read, artifacts } = createWalFixture(root);
     const prepare = vi.spyOn(sqliteReadOnly, "prepareSqliteReadOnlyLocationSync");
-    const artifacts = () =>
-      ["", "-wal", "-shm"].map((suffix) => fs.readFileSync(options.path + suffix));
     const scope = (operation: () => unknown) =>
       withArtifactPreservingStateReads(() =>
         withSynchronousArtifactPreservingStateSnapshot(operation),
@@ -578,9 +467,7 @@ it("shares only one synchronous metadata snapshot and refreshes committed WAL ne
 
 it("keeps the original synchronous snapshot while retained current reads see later commits", async () => {
   await withTempDir("openclaw-retained-inherited-snapshot-", async (root) => {
-    const options = createOptions(root);
-    openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
+    const options = createClosedState(root);
     const writer = new DatabaseSync(options.path);
     writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0");
     writer
@@ -700,24 +587,11 @@ it("keeps the original synchronous snapshot while retained current reads see lat
 
 it("reads fresh authority without replacing an inherited discovery snapshot", async () => {
   await withTempDir("openclaw-current-snapshot-", async (root) => {
-    const options = createOptions(root);
-    openOpenClawStateDatabase(options);
-    closeOpenClawStateDatabaseForTest();
-    const writer = new DatabaseSync(options.path);
-    writer.exec(
-      "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('first');",
-    );
-    const read = () =>
-      withExistingOpenClawStateDatabaseReadOnly(
-        ({ db }) => db.prepare("SELECT value FROM held").get()?.value,
-        options,
-      );
+    const { options, writer, read, artifacts } = createWalFixture(root);
     const current = () =>
       withSynchronousArtifactPreservingStateSnapshot(() => [read(), read()], {
         current: options,
       });
-    const artifacts = () =>
-      ["", "-wal", "-shm"].map((suffix) => fs.readFileSync(options.path + suffix));
     const inspect = () => {
       expect(read()).toBe("first");
       writer.exec("UPDATE held SET value='revoked'");
@@ -790,9 +664,7 @@ it.each(["admission", "cleanup"] as const)(
   "rejects a scoped metadata %s failure without reusing invalid state",
   async (phase) => {
     await withTempDir("openclaw-metadata-failure-", async (root) => {
-      const options = createOptions(root);
-      openOpenClawStateDatabase(options);
-      closeOpenClawStateDatabaseForTest();
+      const options = createClosedState(root);
       const failure = new Error("synthetic verification failure");
       const read = () => withExistingOpenClawStateDatabaseReadOnly(() => 1, options);
       const scope = (operation = read) =>

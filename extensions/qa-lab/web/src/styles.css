@@ -305,28 +305,22 @@ select {
   white-space: nowrap;
 }
 
-.badge-idle {
-  background: var(--bg-elevated);
-  color: var(--text-tertiary);
-}
-
 .badge-running {
   background: var(--warning-soft);
   color: var(--warning-text);
 }
 
-.badge-pass,
-.badge-completed {
+.badge-pass {
   background: var(--success-soft);
   color: var(--success-text);
 }
 
-.badge-fail,
-.badge-failed {
+.badge-fail {
   background: var(--danger-soft);
   color: var(--danger-text);
 }
 
+.badge-idle,
 .badge-pending,
 .badge-skip {
   background: var(--bg-elevated);
@@ -3493,10 +3487,6 @@ button.evidence-matrix-cell {
 }
 
 /* --- Utility --- */
-.text-muted {
-  color: var(--text-secondary);
-}
-
 .text-dimmed {
   color: var(--text-tertiary);
 }

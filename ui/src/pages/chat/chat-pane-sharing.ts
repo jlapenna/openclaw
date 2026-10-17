@@ -12,17 +12,21 @@ import { t } from "../../i18n/index.ts";
 import { formatUiError } from "../../lib/format-error.ts";
 import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import { hasMultiplePresenceIdentities, projectPresencePayload } from "../../lib/presence-users.ts";
+import { readSessionMethodAccess } from "../../lib/session-method-access.ts";
 import { scopedAgentParamsForSession } from "../../lib/sessions/index.ts";
 import {
   resolveUiConversationIdentity,
   scopedSessionArtifactKey,
+  uiConversationMatches,
   uiSessionEventMatches,
 } from "../../lib/sessions/session-key.ts";
+import { readSessionChangedEvent } from "../../lib/sessions/session-row-reconcile.ts";
 import { ChatPaneReactions } from "./chat-pane-reactions.ts";
 import { CHAT_COMPOSER_TEXTAREA_SELECTOR } from "./chat-pane-shared.ts";
 import { selectedChatSessionRow } from "./chat-state-route.ts";
 import {
   typingActorIdForSessionMessage,
+  typingDraftPreview,
   type ChatTypingActorState,
   type ChatTypingActorView,
   type ChatTypingOverflow,
@@ -45,9 +49,37 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
   private typingRequestSentAt?: number;
   private pendingTypingRequest?: () => void;
 
+  protected invalidateSessionSharing(payload: unknown): void {
+    const state = this.state;
+    if (!state) {
+      return;
+    }
+    const event = readSessionChangedEvent(payload);
+    const states = new Map(this.sessionSharingStates);
+    for (const cacheKey of states.keys()) {
+      const [agentId, sessionKey] = cacheKey.split("\0");
+      if (event && !uiConversationMatches(state, sessionKey, event.key, event.agentId, agentId)) {
+        continue;
+      }
+      // Removing the request slot also fences reads started before the change.
+      states.delete(cacheKey);
+      this.sessionSharingHydrationTargets.delete(cacheKey);
+    }
+    this.sessionSharingStates = states;
+  }
+
   protected syncSelectedSessionSharing(session: GatewaySessionRow | undefined): void {
     const sessionId = session?.sessionId?.trim();
-    if (!session || !sessionId || !this.presented || !canManageChatSessionSharing(session)) {
+    if (
+      !session ||
+      !sessionId ||
+      !this.presented ||
+      !canManageChatSessionSharing(session) ||
+      !readSessionMethodAccess(this.context.gateway.snapshot, {
+        method: "session.members.listEvidence",
+        requiredScope: "operator.read",
+      }).allowed
+    ) {
       return;
     }
     const cacheKey = this.sessionSharingCacheKey(session.key);
@@ -59,8 +91,9 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     }
     this.sessionSharingHydrationTargets.set(cacheKey, sessionId);
     const states = new Map(this.sessionSharingStates);
-    states.delete(cacheKey);
-    this.sessionSharingStates = states;
+    if (states.delete(cacheKey)) {
+      this.sessionSharingStates = states;
+    }
     // Selecting a new generation under the same key must supersede an older
     // in-flight read. loadSessionSharing owns the connection and instance guards.
     void this.loadSessionSharing(session, true);
@@ -103,7 +136,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     session: GatewaySessionRow | undefined,
   ): void {
     const signature = session
-      ? `${agentId}\0${session.key}\0${session.sessionId ?? ""}\0${session.visibility ?? "shared"}\0${session.sharingRole ?? "owner"}`
+      ? `${this.connectionGeneration}\0${agentId}\0${session.key}\0${session.sessionId ?? ""}\0${session.visibility ?? "shared"}\0${session.sharingRole ?? "owner"}`
       : "";
     if (signature === this.sessionSuggestionTargetSignature) {
       return;
@@ -153,7 +186,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     ) {
       this.sessionSuggestions = [];
       this.sessionSuggestionRole = undefined;
-      this.requestUpdate();
+      this.chatState.requestBackgroundUpdate();
       return;
     }
     const sessionKey = scope.state.sessionKey;
@@ -176,7 +209,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
       }
       this.sessionSuggestions = result.suggestions;
       this.sessionSuggestionRole = result.role;
-      this.requestUpdate();
+      this.chatState.requestBackgroundUpdate();
     } catch {
       if (
         requestVersion === this.sessionSuggestionsRequestVersion &&
@@ -184,7 +217,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
       ) {
         this.sessionSuggestions = [];
         this.sessionSuggestionRole = undefined;
-        this.requestUpdate();
+        this.chatState.requestBackgroundUpdate();
       }
     }
   }
@@ -218,7 +251,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
       );
     }
     this.sessionSuggestionBusyIds.delete(event.suggestion.id);
-    this.requestUpdate();
+    this.chatState.requestBackgroundUpdate();
     if (shouldRefresh) {
       void this.refreshSessionSuggestions();
     }
@@ -248,7 +281,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     const sessionKey = scope.state.sessionKey;
     const operation = Symbol("session-suggestion-add");
     this.sessionSuggestionAddOperation = operation;
-    this.requestUpdate();
+    this.invalidate();
     try {
       const result = await scope.client.request<{ suggestion: SessionSuggestion }>(
         "session.suggestions.add",
@@ -283,7 +316,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     } finally {
       if (this.sessionSuggestionAddOperation === operation) {
         this.sessionSuggestionAddOperation = undefined;
-        this.requestUpdate();
+        this.invalidate();
       }
     }
   }
@@ -324,13 +357,14 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     this.sessionSuggestionBusyIds.add(suggestion.id);
     if (resolution === "edit") {
       scope.state.handleChatDraftChange(suggestion.text, []);
+      // The native pane hands focus to the composer renderer after publishing the draft.
       queueMicrotask(() =>
-        this.querySelector<HTMLTextAreaElement>(CHAT_COMPOSER_TEXTAREA_SELECTOR)?.focus({
+        this.element.querySelector<HTMLTextAreaElement>(CHAT_COMPOSER_TEXTAREA_SELECTOR)?.focus({
           preventScroll: true,
         }),
       );
     }
-    this.requestUpdate();
+    this.invalidate();
     try {
       const result = await scope.client.request<{ suggestion: SessionSuggestion }>(
         "session.suggestions.resolve",
@@ -344,18 +378,13 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
       if (!isCurrentTarget()) {
         return;
       }
-      if (result.suggestion.author.id === this.context.gateway.snapshot.selfUser?.id) {
-        this.sessionSuggestions = [
-          ...this.sessionSuggestions.filter((item) => item.id !== suggestion.id),
-          result.suggestion,
-        ].toSorted(
-          (left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
-        );
-      } else {
-        this.sessionSuggestions = this.sessionSuggestions.filter(
-          (item) => item.id !== suggestion.id,
-        );
-      }
+      const remaining = this.sessionSuggestions.filter((item) => item.id !== suggestion.id);
+      this.sessionSuggestions =
+        result.suggestion.author.id === this.context.gateway.snapshot.selfUser?.id
+          ? [...remaining, result.suggestion].toSorted(
+              (left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+            )
+          : remaining;
     } catch (error) {
       if (isCurrentTarget()) {
         if (
@@ -379,7 +408,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
           this.sessionSuggestionEditOperation = undefined;
         }
         this.sessionSuggestionBusyIds.delete(suggestion.id);
-        this.requestUpdate();
+        this.invalidate();
       }
     }
   }
@@ -458,7 +487,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     const actor: ChatTypingActorState = {
       label: event.actor.label ?? event.actor.id,
       retireAt: event.preview ? idleDeadline : now + activeMs,
-      ...(event.preview ? { preview: event.preview } : {}),
+      ...(event.preview ? { preview: event.preview, cursor: event.cursor } : {}),
     };
     this.typingActiveIds.add(event.actor.id);
     // Updating a Map entry preserves its arrival order and the two preview slots.
@@ -548,6 +577,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
         id,
         label: actor.label,
         ...(actor.preview ? { preview: actor.preview } : {}),
+        ...(actor.cursor !== undefined ? { cursor: actor.cursor } : {}),
         ...(actor.paused ? { paused: true } : {}),
         ...(actor.exitDurationMs !== undefined ? { exitDurationMs: actor.exitDurationMs } : {}),
       });
@@ -581,6 +611,7 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
           previous?.id === view.id &&
           previous.label === view.label &&
           previous.preview === view.preview &&
+          previous.cursor === view.cursor &&
           previous.paused === view.paused &&
           previous.exitDurationMs === view.exitDurationMs
         );
@@ -591,14 +622,14 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
     }
     this.typingViews = views;
     this.typingOverflow = overflow;
-    this.requestUpdate();
+    this.invalidate();
   }
 
   protected typingActorViews(): ChatTypingActorView[] {
     return this.typingViews;
   }
 
-  protected sendTypingState(typing: boolean, preview?: string): void {
+  protected sendTypingState(typing: boolean, preview?: string, cursor?: number): void {
     const scope = this.captureConnectionScope();
     const row = scope ? selectedChatSessionRow(scope.state) : undefined;
     if (!scope || !row?.sessionId || !this.hasMultipleIdentities()) {
@@ -619,15 +650,14 @@ export abstract class ChatPaneSharing extends ChatPaneReactions {
       ) {
         return;
       }
-      const draft = typing ? preview?.trim() : undefined;
-      const draftPreview = draft ? Array.from(draft).slice(-300).join("") : undefined;
+      const draftPreview = typing && preview ? typingDraftPreview(preview, cursor) : undefined;
       this.typingRequestSentAt = typing ? Date.now() : undefined;
       void scope.client
         .request("session.typing", {
           sessionKey,
           sessionId,
           typing,
-          ...(draftPreview ? { preview: draftPreview } : {}),
+          ...draftPreview,
           ...scopedAgentParamsForSession(scope.state, sessionKey),
         })
         .catch(() => undefined);

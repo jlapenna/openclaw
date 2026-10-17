@@ -63,17 +63,35 @@ export const getCurrentPluginMetadataSnapshotMock: Mock<
 > = vi.fn(() => emptyPluginMetadataSnapshot);
 
 export function mockCompactHooksPluginMetadata(): void {
-  // mock-isolation: Keep plugin discovery and Gateway-owned metadata state outside compaction fixtures.
   vi.doMock("../../plugins/current-plugin-metadata-snapshot.js", () => ({
     getCurrentPluginMetadataSnapshot: getCurrentPluginMetadataSnapshotMock,
-    // Isolated recovery config reads have no process-owned Gateway snapshot.
-    getCompatibleProcessGatewayPluginMetadataSnapshot: () => undefined,
     isCurrentPluginMetadataSnapshotRuntimeGeneration: () => false,
     resolvePluginMetadataControlPlaneFingerprint: vi.fn(() => "test-plugin-fingerprint"),
     createPluginMetadataSnapshotFrame: () =>
       getPluginExecutionFrame() ?? createPluginExecutionFrame({}, undefined),
     withPluginMetadataSnapshotScope: (_snapshot: unknown, run: () => unknown) => run(),
     runOutsidePluginMetadataSnapshotScope: <T>(run: () => T): T => run(),
+  }));
+}
+
+export function mockCompactHooksContextEngine(resolveContextEngine: () => Promise<unknown>): void {
+  // mock-isolation: The compaction fixture does not initialize live plugin registrations.
+  vi.doMock("../../context-engine/init.js", () => ({
+    ensureContextEnginesInitialized: vi.fn(),
+  }));
+
+  // mock-isolation: This harness supplies synthetic engines without registering live plugins.
+  vi.doMock("../../context-engine/registry.js", () => ({
+    hasSameContextEngineInstance: (left: unknown, right: unknown) => left === right,
+    isContextEngineAbortRejection: (error: unknown, signal?: AbortSignal) =>
+      signal?.aborted === true && error === signal.reason,
+    resolveContextEngine,
+    resolveContextEngineOwnerPluginId: vi.fn(() => "lossless-claw"),
+    resolveLogicalTurnContextEngines: async () => {
+      const engine = await resolveContextEngine();
+      const ref = { engine, registeredId: "legacy" };
+      return { configured: ref, configuredId: "legacy", fallback: ref };
+    },
   }));
 }
 
@@ -114,7 +132,7 @@ export function createCompactHooksPreparedModelRuntime(input: {
   };
 }
 
-export function createCompactHooksAuthStorage() {
+function createCompactHooksAuthStorage() {
   const runtimeKeys = new Map<string, string>();
   return {
     setRuntimeApiKey: vi.fn((provider: string, apiKey: string) => {

@@ -8,13 +8,12 @@ export type CompactionAccountingReceipt = {
   tokensBefore: number;
   tokensAfter: number | undefined;
   compactionKind: "context-engine" | "server-endpoint";
+  details?: unknown;
 };
 
 type CompactionAccountingRecorder = CompactionRequestConstraints & {
-  /** The invoking host settles plugin hooks; native internal events still run. */
-  hostOwnsPluginHooks?: boolean;
-  /** The invoking host refreshes its accepted durable successor, not the delegate. */
-  hostOwnsPostCompactionSideEffects?: boolean;
+  /** The queued host owns plugin hooks and refresh; native internal events still run. */
+  hostOwnsCompactionLifecycle?: boolean;
   /** A precheck can require budget recovery while its user request is still pending. */
   pendingRequestState?: "unresolved";
   /** The caller's buffer owns recovery; its portable identity grants no durable access. */

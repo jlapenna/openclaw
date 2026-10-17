@@ -24,6 +24,7 @@
 import { isHttpUrl } from "@openclaw/net-policy/url-protocol";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { BrowserInspectedNode } from "../components/browser/browser-client.ts";
+import { listen } from "../lib/reactive/listener.ts";
 import { hasNativeBrowserBridge } from "./native-browser-host.ts";
 
 export { hasNativeBrowserBridge } from "./native-browser-host.ts";
@@ -106,47 +107,6 @@ function isRect(value: unknown): value is NativeBrowserRect {
     value.height >= 0
   );
 }
-function validMessage(value: unknown): value is NativeBrowserMessage {
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (value.type === "release-scope") {
-    return nonempty(value.scope);
-  }
-  if (value.type === "present") {
-    return (
-      nonempty(value.scope) &&
-      (value.tabId === null || nonempty(value.tabId)) &&
-      (value.rect === null || isRect(value.rect)) &&
-      typeof value.visible === "boolean"
-    );
-  }
-  if (!nonempty(value.tabId)) {
-    return false;
-  }
-  switch (value.type) {
-    case "open":
-      return (
-        browserUrl(value.url) &&
-        sessionKey(value.sessionKey) &&
-        (value.activate === undefined || typeof value.activate === "boolean")
-      );
-    case "navigate":
-      return browserUrl(value.url);
-    case "inspect":
-      return finite(value.x) && value.x >= 0 && finite(value.y) && value.y >= 0;
-    case "back":
-    case "forward":
-    case "reload":
-    case "stop":
-    case "close":
-    case "snapshot":
-    case "download":
-      return true;
-    default:
-      return false;
-  }
-}
 function isState(value: unknown): value is NativeBrowserState {
   if (
     !isRecord(value) ||
@@ -204,10 +164,8 @@ export async function postNativeBrowserMessage(
   if (typeof bridge?.postMessage !== "function") {
     return null;
   }
-  if (!validMessage(message)) {
-    return { ok: false, error: "Invalid native browser request" };
-  }
   try {
+    // Native hosts validate requests at the effect; malformed internal calls return their error.
     const post = bridge.postMessage.bind(bridge);
     const reply = await post(message);
     if (isRecord(reply) && reply.ok === false && typeof reply.error === "string") {
@@ -278,6 +236,5 @@ export function subscribeNativeBrowserState(
       listener(state);
     }
   };
-  window.addEventListener(STATE_EVENT, onState);
-  return () => window.removeEventListener(STATE_EVENT, onState);
+  return listen(window, STATE_EVENT, onState);
 }

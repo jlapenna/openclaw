@@ -26,7 +26,7 @@ async function initializeRepository(repo: string): Promise<void> {
 
 async function addRemote(root: string, repo: string): Promise<string> {
   const remote = path.join(root, "remote.git");
-  await git(root, "init", "--bare", remote);
+  await git(root, "init", "--bare", "-b", "main", remote);
   await git(repo, "remote", "add", "origin", remote);
   await git(repo, "push", "-u", "origin", "main");
   return await fs.realpath(repo);
@@ -38,12 +38,15 @@ export async function initializeManagedWorktreeTestRepository(root: string): Pro
   return await addRemote(root, repo);
 }
 
-export function useManagedWorktreeTestRepository(): (root: string) => Promise<string> {
+export function useManagedWorktreeTestRepository(
+  prepare?: (repo: string) => Promise<void>,
+): (root: string) => Promise<string> {
   const templateDirs = useAutoCleanupTempDirTracker(afterAll);
   let templateRoot: string;
   beforeAll(async () => {
     templateRoot = templateDirs.make("openclaw-worktree-template-");
-    await initializeManagedWorktreeTestRepository(templateRoot);
+    const repo = await initializeManagedWorktreeTestRepository(templateRoot);
+    await prepare?.(repo);
   });
 
   // Copy the initial push too. Each case owns independent Git metadata and a

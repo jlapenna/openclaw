@@ -1,4 +1,5 @@
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
+import { getReplyOperationSessionReader } from "../../../auto-reply/reply/reply-run-registry.state.js";
 import { listRegisteredPluginAgentPromptGuidance } from "../../../plugins/command-registry-state.js";
 import {
   resolveProviderSystemPromptContribution,
@@ -15,13 +16,11 @@ import {
   buildBootstrapPromptWarningNotice,
   buildBootstrapTruncationReportMeta,
 } from "../../bootstrap-budget.js";
+import { buildCodeModeCatalogPrompt } from "../../code-mode.js";
 import { resolveOpenClawReferencePaths } from "../../docs-path.js";
 import { prepareAgentMemoryPrompt } from "../../memory-prompt-prepare.js";
 import { buildModelToolsUnavailablePrompt } from "../../model-tool-support.js";
-import {
-  buildProjectMemoryWriteInstruction,
-  prepareProjectMemoryBootstrap,
-} from "../../project-memory-bootstrap.js";
+import { prepareProjectMemoryBootstrap } from "../../project-memory-bootstrap.js";
 import { resolveAgentPromptSurfaceForSessionKey } from "../../prompt-surface.js";
 import { resolveAgentRuntimePrompt } from "../../runtime-prompt.js";
 import type { buildConfiguredAgentSystemPrompt } from "../../system-prompt-config.js";
@@ -96,6 +95,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
     };
   }
   const policyPreparation = {
+    reader: getReplyOperationSessionReader(attempt.replyOperation),
     signal: attempt.abortSignal,
     assertCurrent: resolveAdmittedRunActiveAssertion(
       attempt.admittedRunContext,
@@ -144,20 +144,30 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
   });
   const resolveToolSchemaDirectoryPrompt = () =>
     params.toolSchemaDirectoryPrompt?.() ??
-    (params.toolSearchDirectoryEnabled && params.toolSearchCatalogRef?.current?.entries.length
-      ? buildToolSchemaDirectoryPrompt(
+    (params.codeModeActive
+      ? buildCodeModeCatalogPrompt(
           {
             config: attempt.config,
-            runtimeConfig: params.toolSearchRuntimeConfig,
+            catalogRef: params.toolSearchCatalogRef,
             agentId: params.setup.sessionAgentId,
             sessionKey: params.setup.sandboxSessionKey,
-            sessionId: attempt.sessionId,
-            runId: attempt.runId,
-            catalogRef: params.toolSearchCatalogRef,
           },
-          { contextTokenBudget: attempt.contextTokenBudget },
+          params.toolSearchCatalogRef?.current?.entries ?? [],
         )
-      : undefined);
+      : params.toolSearchDirectoryEnabled && params.toolSearchCatalogRef?.current?.entries.length
+        ? buildToolSchemaDirectoryPrompt(
+            {
+              config: attempt.config,
+              runtimeConfig: params.toolSearchRuntimeConfig,
+              agentId: params.setup.sessionAgentId,
+              sessionKey: params.setup.sandboxSessionKey,
+              sessionId: attempt.sessionId,
+              runId: attempt.runId,
+              catalogRef: params.toolSearchCatalogRef,
+            },
+            { contextTokenBudget: attempt.contextTokenBudget },
+          )
+        : undefined);
 
   const toolSchemaDirectoryPrompt = resolveToolSchemaDirectoryPrompt();
 
@@ -177,6 +187,13 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       model: `${attempt.provider}/${attempt.modelId}`,
       channel: attempt.messageChannel ?? attempt.messageProvider,
       accountId: attempt.agentAccountId,
+      requester: {
+        agentTo: attempt.messageTo,
+        agentThreadId: attempt.messageThreadId,
+        currentMessagingTarget: attempt.currentMessagingTarget ?? attempt.currentChannelId,
+        currentChannelId: attempt.chatId ?? attempt.currentChannelId,
+        currentThreadTs: attempt.currentThreadTs,
+      },
       chatType: attempt.chatType,
       requesterProfileId: readAdmittedRunOperatorAuthority(attempt.admittedRunContext)?.profileId,
     },
@@ -217,6 +234,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       runtimeHandle: params.setup.getProviderRuntimeHandle(),
       context: promptContributionContext,
     });
+  const projectKey = attempt.preparedModelRuntime?.projectKey ?? undefined;
   const includeMemorySection =
     !params.activeContextEngine || params.activeContextEngine.info.id === "legacy";
   const prepareToolContextSections = async (
@@ -236,6 +254,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
         citationsMode: attempt.config?.memory?.citations,
         agentId: runtimePrompt.runtimeInfo.agentId,
         agentSessionKey: runtimePrompt.runtimeInfo.sessionKey,
+        projectKey,
       }),
       preparedWatchedSessions: await prepareWatchedSessionsPromptAsync({
         ...toolContext,
@@ -275,12 +294,8 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
             : undefined,
         })
       : [];
-  const projectMemoryWriteInstruction = buildProjectMemoryWriteInstruction(
-    attempt.preparedModelRuntime?.projectKey,
-  );
   const extraSystemPrompt = joinPresentTextSegments([
     attempt.extraSystemPrompt,
-    projectMemoryWriteInstruction,
     buildModelToolsUnavailablePrompt(params.modelToolsEnabled),
   ]);
 
@@ -341,6 +356,7 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
       preparedWatchedSessions,
       projectMemoryBootstrap,
       activeProjectKeys,
+      projectKey,
       promptContribution,
     },
   };
@@ -418,15 +434,12 @@ export async function prepareEmbeddedAttemptSystemPrompt(params: {
           capabilityToolNames: capabilities,
           toolSchemaDirectoryPrompt: refreshedToolSchemaDirectoryPrompt,
           sandboxInfo: refreshedSandboxInfo,
-        };
-        Object.assign(
-          embeddedSystemPrompt,
-          await prepareToolContextSections(
+          ...(await prepareToolContextSections(
             tools,
             capabilities,
             refreshedSandboxInfo?.enabled === true,
-          ),
-        );
+          )),
+        };
         const nextSystemPrompt = await buildAttemptSystemPrompt({
           ...promptInputs,
           embeddedSystemPrompt,

@@ -27,6 +27,7 @@ import type { PreparedGatewayModelCatalog } from "./server-model-catalog.types.j
 // Shared Gateway session response contracts. Server methods, UI adapters, and
 // tests import these types so list/patch/preview payloads evolve together.
 export type GatewaySessionsDefaults = {
+  communication?: Required<NonNullable<SessionEntry["communication"]>>;
   modelProvider: string | null;
   model: string | null;
   contextTokens: number | null;
@@ -74,6 +75,8 @@ export type GatewaySessionRow = Omit<SessionRow, "archivedBy" | "updatedAt" | "w
   verboseLevel?: string;
   traceLevel?: string;
   reasoningLevel?: string;
+  /** Configured agent or global reasoning default inherited when reasoningLevel is unset. */
+  reasoningDefault?: "on" | "off" | "stream";
   elevatedLevel?: string;
   sendPolicy?: "allow" | "deny";
   goal?: SessionGoal;

@@ -3,11 +3,10 @@ import type {
   CreateGhosttyTerminalOptions,
   GhosttyTerminalController,
 } from "@openclaw/libterminal/browser";
-import type { ReactiveControllerHost } from "lit";
 import { parseCatalogSessionKey, type CatalogSessionKey } from "../../lib/sessions/catalog-key.ts";
 import type { TerminalGatewayClient } from "./terminal-connection.ts";
 import type { TerminalPanelTab } from "./terminal-panel-tabs.ts";
-import type { TerminalPanelUploadController } from "./terminal-panel-upload.ts";
+import type { TerminalPanelUpload } from "./terminal-panel-upload.ts";
 import type { StartupInputBuffer } from "./terminal-startup-input.ts";
 import type { TerminalTabReadinessState } from "./terminal-tab-readiness.ts";
 
@@ -32,6 +31,14 @@ export type TerminalOperation = {
   generation: number;
   client: TerminalGatewayClient;
   signal: AbortSignal;
+  cancelIntent?: () => void;
+};
+
+export type TerminalRestoreBatch = {
+  operation: TerminalOperation;
+  pending: Map<string, TerminalPanelSessionTab | undefined>;
+  userClosedTab: boolean;
+  input: { interacted: boolean; stop: () => void };
   cancelIntent?: () => void;
 };
 
@@ -61,7 +68,10 @@ export type TerminalPanelSessionControllerState = {
   error: TerminalPanelError | null;
 };
 
-export interface TerminalPanelSessionControllerHost extends ReactiveControllerHost {
+export interface TerminalPanelSessionControllerHost {
+  readonly updateComplete: Promise<unknown>;
+  readonly ownerDocument: Document;
+  requestUpdate(): void;
   readonly isConnected: boolean;
   readonly client: TerminalGatewayClient | null;
   readonly agentId: string | null;
@@ -74,9 +84,10 @@ export interface TerminalPanelSessionControllerHost extends ReactiveControllerHo
   readonly routeTarget: TerminalRouteTarget;
   readonly terminalPanelOpen: boolean;
   readonly catalogReadyTimeoutMs: number;
-  readonly terminalPanelUploadController: TerminalPanelUploadController;
+  readonly terminalPanelUploadController: TerminalPanelUpload;
   createTerminalController(
     options: CreateGhosttyTerminalOptions,
+    shouldFocusOnOpen?: () => boolean,
   ): Promise<GhosttyTerminalController>;
   closeTerminalPanel(): void;
   findTerminalPanelViewport(): Element | null;

@@ -2,7 +2,9 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Locator, Page } from "playwright";
 import { expect, it } from "vitest";
+import { selectChatLayoutAction } from "../test-helpers/chat-layout-menu.ts";
 import { createControlUiE2eArtifactDir } from "../test-helpers/control-ui-e2e-artifacts.ts";
+import { evaluateControlUiContext } from "../test-helpers/control-ui-e2e-context.ts";
 import {
   controlUiBundledSettingsStorageKey,
   controlUiSessionUrl,
@@ -399,7 +401,7 @@ suite.define(() => {
         ],
       });
       const startupsBefore = (await gateway.getRequests("chat.startup")).length;
-      await page.getByRole("button", { name: "Open split view", exact: true }).click();
+      await selectChatLayoutAction(page, "Open split view");
       await expect.poll(() => panes.count()).toBe(2);
       await gateway.waitForRequest("chat.startup", { after: startupsBefore });
       await gateway.resolveDeferred("chat.metadata");
@@ -431,7 +433,7 @@ suite.define(() => {
     "late follower without metadata",
     "late follower without metadata, metadata first",
     "late follower, catalog first",
-  ])("coalesces invalidations behind an unfinished pair (%s)", async (presentation) => {
+  ])("coalesces fresh catalog reads after pending work (%s)", async (presentation) => {
     await suite.withPage({ viewport: { width: 1440, height: 900 } }, async ({ page }) => {
       const paneCount = presentation === "shared" ? 2 : 1;
       if (presentation === "shared") {
@@ -456,6 +458,12 @@ suite.define(() => {
       for (const method of methods) {
         await gateway.waitForRequest(method, { after: before[method] });
       }
+      const pendingCatalogCount = await gateway.deferNext("models.list");
+      const resolvePending = (method: (typeof methods)[number]) =>
+        gateway.resolveDeferred(
+          method,
+          method === "models.list" ? { models: [{ ...model, name: "Retired model" }] } : undefined,
+        );
       await gateway.setMethodResponse("models.list", { models: [freshModel] });
       await gateway.emitGatewayEvent("chat.metadata.changed", {});
       await gateway.emitGatewayEvent("chat.metadata.changed", {});
@@ -469,7 +477,7 @@ suite.define(() => {
             ? { metadata: { commands: [], models: [model] } }
             : {}),
         });
-        await page.getByRole("button", { name: "Open split view", exact: true }).click();
+        await selectChatLayoutAction(page, "Open split view");
         await expect.poll(() => panes.count()).toBe(2);
       }
       expect(await requestCounts(gateway)).toEqual({
@@ -482,7 +490,7 @@ suite.define(() => {
           ? "models.list"
           : undefined;
       if (first) {
-        await gateway.resolveDeferred(first);
+        await resolvePending(first);
         await page.evaluate(
           () =>
             new Promise<void>((resolve) => {
@@ -496,9 +504,15 @@ suite.define(() => {
       }
       for (const method of methods) {
         if (method !== first) {
-          await gateway.resolveDeferred(method);
+          await resolvePending(method);
         }
       }
+      await gateway.waitForRequest("models.list", { after: pendingCatalogCount });
+      expect(await gateway.getRequests("models.list")).toHaveLength(before["models.list"] + 2);
+      for (const pane of await panes.all()) {
+        await expectCatalog(pane, model.name);
+      }
+      await gateway.resolveDeferred("models.list");
       for (const pane of await panes.all()) {
         await expectCatalog(pane, freshModel.name);
       }
@@ -592,11 +606,8 @@ suite.define(() => {
         )
         .toBe("global");
       await gateway.setMethodResponse("models.list", { models: [freshModel] });
-      await page.evaluate(() => {
-        const app = document.querySelector("openclaw-app") as HTMLElement & {
-          runtime: { context: { agentSelection: { set: (agent: string) => void } } };
-        };
-        app.runtime.context.agentSelection.set("work");
+      await evaluateControlUiContext(page, (context) => {
+        context.agentSelection.set("work");
       });
       await expect
         .poll(() =>

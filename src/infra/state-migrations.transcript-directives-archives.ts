@@ -1,14 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
 import {
-  decodeSessionArchiveBytes,
   encodeSessionArchiveContent,
   SESSION_ARCHIVE_ZSTD_SUFFIX,
 } from "../config/sessions/archive-compression.js";
 import { resolveSqliteTranscriptArchiveDirectory } from "../config/sessions/session-accessor.sqlite-scope.js";
-import {
-  assertAgentDatabaseMaintenanceAuthority,
-  renewAgentDatabaseMaintenanceAuthorityIfPresent,
-} from "../state/openclaw-agent-db-lease.js";
+import { renewAgentDatabaseMaintenanceAuthorityIfPresent } from "../state/openclaw-agent-db-lease.js";
+import { assertAgentDatabaseMaintenanceAuthority } from "../state/openclaw-agent-db-maintenance-authority.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
 import { SESSION_TRANSCRIPT_ARCHIVES_TABLE } from "../state/openclaw-agent-session-transcript-archive-schema.js";
 import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "../state/openclaw-state-db.js";
@@ -41,10 +38,8 @@ import {
   transcriptArchiveRecoveryRowKey,
   writeTranscriptArchiveRecoveryJournal,
 } from "./state-migrations.transcript-archive-publication.js";
-import {
-  parseDirectiveMigrationTranscriptEvent,
-  transformHistoricalTranscriptEvent,
-} from "./state-migrations.transcript-directives-transform.js";
+import { transformArchiveBytesIncrementally } from "./state-migrations.transcript-archive-stream.js";
+import { repairHistoricalTranscriptEventJson } from "./state-migrations.transcript-directives-transform.js";
 
 export const TRANSCRIPT_DIRECTIVE_MIGRATION_BATCH_SIZE = TRANSCRIPT_ARCHIVE_MIGRATION_BATCH_SIZE;
 export const MEDIA_ARCHIVE_VERIFICATION_KEY = "media-transcript-archive-verification-v1";
@@ -57,9 +52,11 @@ type TranscriptArchiveMigrationDatabase = Pick<
 
 type ArchiveCursor = { generation: string; sessionId: string };
 
-type ArchiveContentTransform = (
-  content: string,
+/** Line transform for one archive row; the session id scopes recorded-fact lookups. */
+export type ArchiveSessionLineTransform = (
+  line: string,
   owner: string,
+  sessionId: string,
 ) => { changed: boolean; content: string };
 
 type ArchiveMigrationOptions = {
@@ -70,6 +67,7 @@ type ArchiveMigrationOptions = {
   signal?: AbortSignal;
   verification?: { key: string; prepared?: ReadonlySet<string>; collect?: Set<string> };
   verifyOnly?: boolean;
+  beforeRewrite?: () => void;
   writeCursor?: (cursor: ArchiveCursor | { phase: "complete" }) => void;
 };
 
@@ -92,35 +90,15 @@ type ArchiveRowPlan = {
   fingerprint?: string;
 };
 
-function transformArchiveContent(
-  content: string,
-  owner: string,
-): {
-  changed: boolean;
-  content: string;
-} {
-  if (!content) {
-    return { changed: false, content };
-  }
-  const trailingNewline = content.endsWith("\n");
-  const lines = trailingNewline ? content.slice(0, -1).split("\n") : content.split("\n");
-  let changed = false;
-  const rewritten = lines.map((line, index) => {
-    if (!line) {
-      throw new Error(`${owner} contains a blank JSONL record at line ${index + 1}`);
-    }
-    const event = parseDirectiveMigrationTranscriptEvent(line, `${owner}:${index + 1}`);
-    const transformed = transformHistoricalTranscriptEvent(event);
-    changed ||= transformed.changed;
-    return transformed.changed ? JSON.stringify(transformed.event) : line;
+const transformArchiveDirectiveLine: ArchiveSessionLineTransform = (raw, owner) =>
+  repairHistoricalTranscriptEventJson({
+    raw,
+    owner,
+    scope: "all",
+    resolveMaskedProvider: () => undefined,
   });
-  return {
-    changed,
-    content: `${rewritten.join("\n")}${trailingNewline ? "\n" : ""}`,
-  };
-}
 
-function encodeArchiveContent(
+export function encodeArchiveContent(
   content: string,
   encoding: "identity" | "zstd",
   owner: string,
@@ -151,16 +129,16 @@ function hasArchiveTable(database: DatabaseSync): boolean {
   );
 }
 
-function listArchiveBatch(
+async function listArchiveBatch(
   database: DatabaseSync,
   cursor: ArchiveCursor | undefined,
-  transformContent: ArchiveContentTransform = transformArchiveContent,
+  transformLine: ArchiveSessionLineTransform,
   options?: {
-    archiveDirectory: string;
+    archiveDirectory?: string;
     signal?: AbortSignal;
     verified?: ReadonlySet<string>;
   },
-): ArchiveRowPlan[] {
+): Promise<ArchiveRowPlan[]> {
   const db = getNodeSqliteKysely<TranscriptArchiveMigrationDatabase>(database);
   let query = db
     .selectFrom("session_transcript_archives")
@@ -187,9 +165,10 @@ function listArchiveBatch(
       ),
     );
   }
-  return executeSqliteQuerySync(database, query).rows.map((row) => {
+  const plans: ArchiveRowPlan[] = [];
+  for (const row of executeSqliteQuerySync(database, query).rows) {
     const owner = `${row.session_id}:${row.generation}`;
-    const archivePath = options
+    const archivePath = options?.archiveDirectory
       ? transcriptArchivePathFor(options.archiveDirectory, row.archive_name)
       : row.archive_name;
     try {
@@ -199,18 +178,22 @@ function listArchiveBatch(
       if (sha256Hex(bytes) !== row.archive_sha256) {
         throw new Error("Canonical SQLite transcript archive is corrupt");
       }
-      const fingerprint = options
+      const fingerprint = options?.archiveDirectory
         ? transcriptArchiveFingerprint(archivePath, row.archive_sha256, encoding)
         : undefined;
       const verified = fingerprint !== undefined && options?.verified?.has(fingerprint) === true;
       const transformed = verified
         ? undefined
-        : transformContent(decodeSessionArchiveBytes(bytes, encoding === "zstd"), owner);
+        : await transformArchiveBytesIncrementally({
+            bytes,
+            encoding,
+            owner,
+            signal: options?.signal,
+            transformLine: (line, lineOwner) => transformLine(line, lineOwner, row.session_id),
+          });
       options?.signal?.throwIfAborted();
-      const nextBytes = transformed?.changed
-        ? encodeArchiveContent(transformed.content, encoding, owner)
-        : bytes;
-      return {
+      const nextBytes = transformed?.bytes ?? bytes;
+      plans.push({
         archiveName: row.archive_name,
         archiveSha256: row.archive_sha256,
         bytes,
@@ -222,7 +205,7 @@ function listArchiveBatch(
         publishedAt: row.published_at,
         sessionId: row.session_id,
         fingerprint: verified ? fingerprint : undefined,
-      };
+      });
     } catch (error) {
       if (options?.signal?.aborted && error === options.signal.reason) {
         throw error;
@@ -232,12 +215,14 @@ function listArchiveBatch(
         cause: error,
       });
     }
-  });
+  }
+  return plans;
 }
 
 export async function transcriptDirectiveArchivesNeedMigration(
   database: DatabaseSync,
   start: ArchiveCursor,
+  transformLine: ArchiveSessionLineTransform = transformArchiveDirectiveLine,
 ): Promise<boolean> {
   const signal = resolveSqliteInspectionSignal();
   signal?.throwIfAborted();
@@ -250,7 +235,7 @@ export async function transcriptDirectiveArchivesNeedMigration(
   let cursor: ArchiveCursor | undefined = start.sessionId || start.generation ? start : undefined;
   while (true) {
     signal?.throwIfAborted();
-    const batch = listArchiveBatch(database, cursor);
+    const batch = await listArchiveBatch(database, cursor, transformLine, { signal });
     const last = batch.at(-1);
     if (!last) {
       return false;
@@ -374,7 +359,7 @@ function finalizeArchiveCursor(params: {
 export async function migrateCanonicalTranscriptArchives(
   params: ArchiveMigrationOptions & {
     onArchive?: (archivePath: string) => void;
-    transformContent: ArchiveContentTransform;
+    transformLine: ArchiveSessionLineTransform;
   },
 ): Promise<ArchiveMigrationResult> {
   const signal = resolveSqliteInspectionSignal(params.signal);
@@ -436,7 +421,7 @@ export async function migrateCanonicalTranscriptArchives(
       renewAgentDatabaseMaintenanceAuthorityIfPresent();
     }
     const batch = archivesPresent
-      ? listArchiveBatch(params.database, cursor, params.transformContent, {
+      ? await listArchiveBatch(params.database, cursor, params.transformLine, {
           archiveDirectory,
           signal,
           verified,
@@ -508,6 +493,7 @@ export async function migrateCanonicalTranscriptArchives(
               return !planned.changed && assertArchiveSourceUnchanged(params.database, planned);
             })
           : write("historical-transcript-archive-directives", () => {
+              params.beforeRewrite?.();
               const pending = new Map(
                 (readTranscriptArchiveRecoveryJournal(params.database)?.rows ?? []).map((row) => [
                   transcriptArchiveRecoveryRowKey(row),
@@ -666,7 +652,7 @@ export async function prepareCanonicalTranscriptArchiveMigrations(
           start: { generation: "", sessionId: "" },
           verifyOnly: true,
           verification: { key: MEDIA_ARCHIVE_VERIFICATION_KEY, collect: prepared },
-          transformContent: transformMediaArchiveContent,
+          transformLine: transformMediaArchiveContent,
         });
       } finally {
         clearNodeSqliteKyselyCacheForDatabase(database);
@@ -677,10 +663,10 @@ export async function prepareCanonicalTranscriptArchiveMigrations(
 }
 
 export function migrateTranscriptDirectiveArchives(
-  params: ArchiveMigrationOptions,
+  params: ArchiveMigrationOptions & { transformLine?: ArchiveSessionLineTransform },
 ): Promise<ArchiveMigrationResult> {
   return migrateCanonicalTranscriptArchives({
     ...params,
-    transformContent: transformArchiveContent,
+    transformLine: params.transformLine ?? transformArchiveDirectiveLine,
   });
 }
