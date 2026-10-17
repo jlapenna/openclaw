@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import type * as ConfigRuntime from "../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ContextEngine, ContextEngineRuntimeContext } from "../../context-engine/types.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
@@ -23,6 +24,7 @@ import {
   resolveModelMock,
   triggerInternalHookMock,
 } from "./compact.hooks.harness.js";
+import type * as CompactionHooks from "./compaction-hooks.js";
 
 const { requestPreparedCompaction } = vi.hoisted(() => ({
   requestPreparedCompaction:
@@ -43,13 +45,15 @@ let databases: typeof import("../../state/openclaw-agent-db.js");
 let streamResolution: typeof import("./stream-resolution.js");
 let replay: typeof import("../openai-transport-stream.test-support.js").testing;
 let accounting: typeof import("./run/compaction-accounting-bridge.js");
-let compactionHooks: typeof import("./compaction-hooks.js");
+let compactionHooks: typeof CompactionHooks;
+let configRuntime: typeof ConfigRuntime;
 let requestBudgets: typeof import("../sessions/compaction/request-budget.js");
 let pressure: typeof import("./run/preemptive-compaction.js");
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
     await databases.closeOpenClawAgentDatabasesAsync();
     databases.closeOpenClawAgentDatabasesForTest();
+    configRuntime.clearRuntimeConfigSnapshot();
     cleanup();
   }),
 );
@@ -79,6 +83,7 @@ beforeAll(async () => {
     { testing: replay },
     accounting,
     compactionHooks,
+    configRuntime,
     requestBudgets,
     pressure,
   ] = await Promise.all([
@@ -90,6 +95,7 @@ beforeAll(async () => {
     import("../openai-transport-stream.test-support.js"),
     import("./run/compaction-accounting-bridge.js"),
     import("./compaction-hooks.js"),
+    import("../../config/runtime-snapshot.js"),
     import("../sessions/compaction/request-budget.js"),
     import("./run/preemptive-compaction.js"),
   ]);
@@ -191,6 +197,7 @@ async function createFixture(operation: "summary" | "endpoint", globalAlias = fa
       },
     },
   } satisfies ContextEngineRuntimeContext & { config: OpenClawConfig };
+  configRuntime.setRuntimeConfigSnapshot(runtimeContext.config);
   const recordUsage = vi.fn();
   const recordCompaction = vi.fn();
   accounting.attachCompactionAccountingRecorder(runtimeContext, { recordUsage, recordCompaction });
