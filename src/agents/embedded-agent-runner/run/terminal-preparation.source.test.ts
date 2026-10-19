@@ -14,7 +14,8 @@ const payloadMocks = vi.hoisted(() => ({
   buildEmbeddedRunPayloads: vi.fn<typeof buildEmbeddedRunPayloads>(),
 }));
 
-vi.mock("./payloads.js", () => ({
+vi.mock("./payloads.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./payloads.js")>()),
   buildEmbeddedRunPayloads: payloadMocks.buildEmbeddedRunPayloads,
 }));
 
