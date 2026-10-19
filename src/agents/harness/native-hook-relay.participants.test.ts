@@ -11,7 +11,8 @@ import {
 import { prepareOperatorModelPolicy } from "../operator-model-policy.js";
 import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
 import { createAgentHarnessHostCapabilities } from "./host-capability.js";
-import { invokeNativeHookRelay, testing } from "./native-hook-relay.js";
+import { invokeNativeHookRelay } from "./native-hook-relay.js";
+import { clearNativeHookRelaysForTests } from "./native-hook-relay.test-support.js";
 
 const { createCodexNativeSpawnRelayForTest } = await loadBundledPluginFacade<{
   createCodexNativeSpawnRelayForTest: (params: {
@@ -24,7 +25,7 @@ const { createCodexNativeSpawnRelayForTest } = await loadBundledPluginFacade<{
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  await testing.clearNativeHookRelaysForTests();
+  await clearNativeHookRelaysForTests();
   vi.useRealTimers();
 });
 
@@ -150,7 +151,7 @@ it("denies native spawn at final admission when another person steers the parent
             for (const name of ["Agent", "spawn_agent", "crewspawn_agent"]) {
               expectDenied(await invoke(name, `ambiguous-${name}`), ambiguity);
             }
-            turn.complete();
+            await turn.complete();
             expectDenied(await invoke("Agent", "ended-spawn"), /turn has ended/);
           } finally {
             resume.resolve();

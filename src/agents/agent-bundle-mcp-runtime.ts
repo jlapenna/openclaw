@@ -1,28 +1,14 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import {
-  ListToolsResultSchema,
-  type CallToolResult,
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { Client, type Transport, type Tool } from "@modelcontextprotocol/client";
 import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { asOptionalObjectRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { withGuardedFetchRequestAuthority } from "../infra/net/fetch-request-authority.js";
 import { logWarn } from "../logger.js";
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
   projectBundleMcpCatalogTools,
-  projectUnavailableBundleMcpCatalog,
+  projectBundleMcpCatalogFailure,
 } from "./agent-bundle-mcp-catalog-projection.js";
-import {
-  createCombinedSessionMcpRuntime,
-  mergeMcpToolCatalogs,
-} from "./agent-bundle-mcp-combined.js";
-import {
-  disposeAllSessionMcpRuntimes,
-  getSessionMcpRuntimeManagerForTesting,
-} from "./agent-bundle-mcp-manager-api.js";
+import { createCombinedSessionMcpRuntime } from "./agent-bundle-mcp-combined.js";
 import { getSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
 import { loadSessionMcpConfig } from "./agent-bundle-mcp-runtime-config.js";
 import { sessionMcpRuntimeOwners } from "./agent-bundle-mcp-runtime-owner.js";
@@ -31,9 +17,7 @@ import type {
   McpRequestOptions,
   McpServerCatalog,
   McpToolCatalog,
-  McpToolCatalogDiagnostic,
   SessionMcpRuntime,
-  SessionMcpRuntimeManager,
 } from "./agent-bundle-mcp-types.js";
 import { readMcpAppIcons, readMcpAppSettingsCapability } from "./mcp-app-extension-metadata.js";
 import { listAllMcpTools, MCP_CATALOG_LIST_LIMITS } from "./mcp-catalog-listing.js";
@@ -55,6 +39,16 @@ import { isMcpMethodNotFoundError, redactMcpDiagnosticError } from "./mcp-error.
 import { createMcpJsonSchemaValidator } from "./mcp-json-schema-validator.js";
 import { buildMcpClientCapabilities, summarizeServerCapabilities } from "./mcp-metadata.js";
 import { collectMcpPaginatedItems } from "./mcp-pagination.js";
+import {
+  mcpCallToolResultSchema,
+  mcpGetPromptResultSchema,
+  mcpListResourceTemplatesResultSchema,
+  mcpListToolsResultSchema,
+  toLegacyMcpCallToolResult,
+  toLegacyMcpGetPromptResult,
+  toLegacyMcpListResourceTemplatesResult,
+  toLegacyMcpListToolsResult,
+} from "./mcp-sdk-compatibility.js";
 import {
   connectWithMcpStartupBackoff,
   McpStartupBackoffError,
@@ -87,14 +81,6 @@ const BUNDLE_MCP_CATALOG_FAILURE_RETRY_MS = 5_000;
 // Tool materialization awaits catalog listing. Bound it for servers without an
 // explicit request timeout, with room for a cold remote (OAuth, HTTP) listing.
 const BUNDLE_MCP_CATALOG_LIST_TIMEOUT_MS = 10_000;
-let bundleMcpCatalogListTimeoutMs: number | undefined;
-const BUNDLE_MCP_DISPOSE_TIMEOUT_MS = 5_000;
-const BUNDLE_MCP_TEST_STATE_KEY = Symbol.for("openclaw.bundleMcpTestState");
-type BundleMcpTestState = { disposeTimeoutMs?: number };
-
-function getBundleMcpTestState(): BundleMcpTestState {
-  return resolveGlobalSingleton(BUNDLE_MCP_TEST_STATE_KEY, () => ({}));
-}
 
 type McpServerBackoffState = {
   session: BundleMcpSession;
@@ -104,47 +90,12 @@ type McpServerBackoffState = {
 
 export { createMcpJsonSchemaValidator as createBundleMcpJsonSchemaValidator };
 
-function hasConfiguredMcpRequestTimeout(rawServer: unknown): boolean {
+function getCatalogListTimeoutMs(rawServer: unknown, requestTimeoutMs: number): number {
   const record = asOptionalObjectRecord(rawServer);
-  return ["requestTimeoutMs", "timeout"].some(
+  const configured = ["requestTimeoutMs", "timeout"].some(
     (key) => asPositiveFiniteNumber(record?.[key]) !== undefined,
   );
-}
-
-function getCatalogListTimeoutMs(rawServer: unknown, requestTimeoutMs: number): number {
-  if (bundleMcpCatalogListTimeoutMs !== undefined) {
-    return bundleMcpCatalogListTimeoutMs;
-  }
-  return hasConfiguredMcpRequestTimeout(rawServer)
-    ? requestTimeoutMs
-    : BUNDLE_MCP_CATALOG_LIST_TIMEOUT_MS;
-}
-
-function setBundleMcpCatalogListTimeoutMsForTest(timeoutMs?: number): void {
-  bundleMcpCatalogListTimeoutMs =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? Math.floor(timeoutMs)
-      : undefined;
-}
-
-function setBundleMcpDisposeTimeoutMsForTest(timeoutMs?: number): void {
-  // Non-isolated test workers can reload this module while a facade still
-  // references an older copy. Share the override across those copies.
-  getBundleMcpTestState().disposeTimeoutMs =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? Math.floor(timeoutMs)
-      : undefined;
-}
-
-function disposeBundleMcpSession(session: BundleMcpSession): Promise<"closed" | "uncertain"> {
-  return disposeMcpClient(
-    session,
-    getBundleMcpTestState().disposeTimeoutMs ?? BUNDLE_MCP_DISPOSE_TIMEOUT_MS,
-  );
-}
-
-function createDisposedError(sessionId: string): Error {
-  return new Error(`bundle-mcp runtime disposed for session ${sessionId}`);
+  return configured ? requestTimeoutMs : BUNDLE_MCP_CATALOG_LIST_TIMEOUT_MS;
 }
 
 type ServerMcpRuntime = SessionMcpRuntime & {
@@ -269,7 +220,7 @@ export function createSessionMcpRuntime(
         execute &&
         (async (...args) => {
           if (!connectFingerprints.has(serverName)) {
-            throw createDisposedError(params.sessionId);
+            throw new Error(`bundle-mcp runtime disposed for session ${params.sessionId}`);
           }
           return await execute(...args);
         })
@@ -397,27 +348,32 @@ function createServerMcpRuntime(
   let retiredCatalog: McpToolCatalog | undefined;
   const lifecycleAbortController = new AbortController();
   let catalog: McpToolCatalog | null = null;
+  // Transport health cannot revoke advertised schemas; only a successful list
+  // or retirement of this configuration owner replaces them.
+  let lastListedCatalog: McpToolCatalog | undefined;
   let catalogRetryAfterMs: number | undefined;
   let catalogInFlight: Promise<McpToolCatalog> | undefined;
-  let catalogInvalidationGeneration = 0;
   const invalidateCatalog = () => {
-    catalogInvalidationGeneration += 1;
     catalog = null;
     catalogRetryAfterMs = undefined;
   };
   const scheduleCatalogServerRetry = (message: string) => {
-    const unavailableCatalog = projectUnavailableBundleMcpCatalog(catalog, serverName, message);
-    if (!unavailableCatalog) {
-      invalidateCatalog();
-      return;
+    const server = lastListedCatalog?.servers[serverName];
+    invalidateCatalog();
+    if (server) {
+      catalog = projectBundleMcpCatalogFailure(lastListedCatalog, {
+        serverName,
+        safeServerName: server.safeServerName ?? serverName,
+        launchSummary: server.launchSummary,
+        message,
+      });
+      catalogRetryAfterMs = Date.now();
     }
-    catalogInvalidationGeneration += 1;
-    catalog = unavailableCatalog;
-    catalogRetryAfterMs = Date.now();
   };
   const catalogRetryIsDue = (): boolean =>
     catalogRetryAfterMs !== undefined && Date.now() >= catalogRetryAfterMs;
   let currentSession: BundleMcpSession | undefined;
+  let awaitSseRecovery = false;
   let disposal: Promise<void> | undefined;
   let cleanupFailed = false;
   const pendingDisposals = new Set<Promise<void>>();
@@ -425,7 +381,7 @@ function createServerMcpRuntime(
     if (session.disposePromise) {
       return session.disposePromise;
     }
-    const closing = disposeBundleMcpSession(session)
+    const closing = disposeMcpClient(session)
       .then((outcome) => {
         if (outcome === "uncertain") {
           cleanupFailed = true;
@@ -459,12 +415,13 @@ function createServerMcpRuntime(
   };
   const failIfDisposed = () => {
     if (retiredCatalog) {
-      throw createDisposedError(params.sessionId);
+      throw new Error(`bundle-mcp runtime disposed for session ${params.sessionId}`);
     }
   };
   const requireConnectedSession = (): BundleMcpSession => {
     const session = currentSession;
-    if (!session || !session.connected) {
+    // Retained descriptors cannot admit calls before the replacement finishes listing.
+    if (!session || !session.connected || !session.toolMetadata) {
       throw new Error(
         session?.disconnectReason
           ? `bundle-mcp server "${serverName}" is disconnected: ${session.disconnectReason}`
@@ -595,8 +552,14 @@ function createServerMcpRuntime(
             const requestOptions = { timeout, maxTotalTimeout: timeout, signal: requestSignal };
             const page =
               kind === "resources"
-                ? await session.client.listResources(requestParams, requestOptions)
-                : await session.client.listPrompts(requestParams, requestOptions);
+                ? await session.client.request(
+                    { method: "resources/list", params: requestParams },
+                    requestOptions,
+                  )
+                : await session.client.request(
+                    { method: "prompts/list", params: requestParams },
+                    requestOptions,
+                  );
             const items = page[kind] as unknown[];
             return { items, nextCursor: page.nextCursor, serializedValue: page };
           },
@@ -610,7 +573,6 @@ function createServerMcpRuntime(
     if (catalogInFlight) {
       return catalogInFlight;
     }
-    const catalogGeneration = catalogInvalidationGeneration;
     const inFlight = (async (): Promise<McpToolCatalog> => {
       const rawServer = loaded.mcpServers[serverName]!;
       const override = params.connectionOverrides?.get(serverName);
@@ -634,14 +596,9 @@ function createServerMcpRuntime(
       failIfDisposed();
 
       let session = currentSession;
-      while (session && !session.retiring && !session.connected && !session.connectPromise) {
+      if (session && !session.connected && !session.connectPromise) {
         // A closed SDK client cannot reconnect cleanly on the same transport.
         await retireSessionIfCurrent(session);
-        // Retirement yields while closing. Preserve any replacement that a
-        // newer catalog generation installed during that await.
-        session = currentSession;
-      }
-      if (session?.retiring) {
         session = undefined;
       }
       const reusedSession = Boolean(session);
@@ -654,6 +611,7 @@ function createServerMcpRuntime(
           },
           {
             capabilities: buildMcpClientCapabilities(mcpAppsEnabled),
+            versionNegotiation: { mode: "legacy" },
             jsonSchemaValidator: schemaValidator,
             listChanged: {
               tools: {
@@ -697,6 +655,7 @@ function createServerMcpRuntime(
             !createdSession.retiring &&
             currentSession === createdSession
           ) {
+            awaitSseRecovery ||= createdSession.transportType === "sse";
             scheduleCatalogServerRetry("mcp transport closed");
             logWarn(`bundle-mcp: server "${serverName}" closed; next request reconnects`);
           }
@@ -738,9 +697,7 @@ function createServerMcpRuntime(
           }
         }
         failIfDisposed();
-        const toolFilter = normalizeMcpToolFilter(
-          isRecord(rawServer) ? rawServer.toolFilter : undefined,
-        );
+        const toolFilter = normalizeMcpToolFilter(rawServer.toolFilter);
         const denialMap = params.toolOverrides?.mcpToolsDeny;
         const deniedToolNames = new Set(
           denialMap && Object.hasOwn(denialMap, serverName) ? denialMap[serverName] : [],
@@ -810,43 +767,36 @@ function createServerMcpRuntime(
             `bundle-mcp: failed to ${action} server "${serverName}" (${launchDescription}): ${message}`,
           );
         }
-        const diags: McpToolCatalogDiagnostic[] = [
-          {
-            serverName,
-            safeServerName,
-            launchSummary: launchDescription,
-            message,
-          },
-        ];
-        if (
-          !session.connected ||
-          isMcpHttpSessionExpired(session, error) ||
-          (!reusedSession && catalogInvalidationGeneration === catalogGeneration)
-        ) {
-          // Closed, expired, or isolated failed startups need a fresh process.
-          // A superseding catalog may reuse a healthy session; identity guards
-          // preserve any replacement installed before retirement yields.
+        if (!session.connected || isMcpHttpSessionExpired(session, error) || !reusedSession) {
+          // Closed, expired, or failed startups need a fresh process.
           await retireSessionIfCurrent(session);
         }
         failIfDisposed();
-        return { version: 1, generatedAt: Date.now(), servers: {}, tools: [], diagnostics: diags };
+        return projectBundleMcpCatalogFailure(lastListedCatalog, {
+          serverName,
+          safeServerName,
+          launchSummary: launchDescription,
+          message,
+        });
       }
     })();
     catalogInFlight = inFlight;
     try {
       const nextCatalog = await inFlight;
       failIfDisposed();
-      if (catalogInvalidationGeneration === catalogGeneration) {
-        catalog = nextCatalog;
-        catalogRetryAfterMs = nextCatalog.diagnostics?.length
-          ? (startupRetryAfterMs ?? Date.now() + BUNDLE_MCP_CATALOG_FAILURE_RETRY_MS)
-          : undefined;
+      // A list-change notification during this load is best effort; the next
+      // notification or explicit refresh replaces the completed inventory.
+      catalog = nextCatalog;
+      if (!nextCatalog.diagnostics?.length) {
+        lastListedCatalog = nextCatalog;
+        awaitSseRecovery = false;
       }
+      catalogRetryAfterMs = nextCatalog.diagnostics?.length
+        ? (startupRetryAfterMs ?? Date.now() + BUNDLE_MCP_CATALOG_FAILURE_RETRY_MS)
+        : undefined;
       return nextCatalog;
     } finally {
-      if (catalogInFlight === inFlight) {
-        catalogInFlight = undefined;
-      }
+      catalogInFlight = undefined;
     }
   };
 
@@ -855,15 +805,16 @@ function createServerMcpRuntime(
     if (catalog && !catalogRetryIsDue()) {
       return catalog;
     }
-    if (!catalog) {
-      await loadCatalog();
-      if (catalog) {
-        return catalog;
-      }
-      // Replay one in-flight invalidation before accepting the latest completed
-      // snapshot. A server that invalidates every list must not block its siblings.
-      const replayedCatalog = await loadCatalog();
-      return catalog ?? replayedCatalog;
+    if (!catalog || !lastListedCatalog) {
+      const retryExitedProcess = currentSession?.transportType === "stdio";
+      const loadedCatalog = await loadCatalog();
+      // Recover a previously healthy process once; HTTP list failures retain their diagnostic.
+      return retryExitedProcess &&
+        loadedCatalog.diagnostics?.length &&
+        lastListedCatalog &&
+        !currentSession
+        ? loadCatalog()
+        : loadedCatalog;
     }
 
     const staleCatalog = catalog;
@@ -882,6 +833,9 @@ function createServerMcpRuntime(
     const signal = getSessionMcpRequestSignal();
     signal?.throwIfAborted();
     await racePromiseWithAbortSignal(getCatalog(), signal);
+    if (awaitSseRecovery && catalogInFlight) {
+      await racePromiseWithAbortSignal(catalogInFlight, signal);
+    }
     return requireConnectedSession();
   };
 
@@ -926,7 +880,7 @@ function createServerMcpRuntime(
           return;
         }
         released = true;
-        activeLeases = Math.max(0, activeLeases - 1);
+        activeLeases -= 1;
         // Release is not use: refreshing lastUsedAt here defeats the idle-sweep TTL.
       };
     },
@@ -948,17 +902,20 @@ function createServerMcpRuntime(
     async callTool(requestedServer, toolName, input, options) {
       const session = await getActiveSession(requestedServer);
       const validateResult = session.toolMetadata?.validatorForCall(toolName);
-      const result = (await runGuardedMcpRequest(session, (signal, holdForHumanInput) => {
+      const result = await runGuardedMcpRequest(session, (signal, holdForHumanInput) => {
         options?.assertCurrent?.();
         const call = () =>
           withGuardedFetchRequestAuthority(options?.assertCurrent, () =>
-            session.client.callTool(
+            session.client.request(
               {
-                name: toolName,
-                arguments: isRecord(input) ? input : {},
-                ...(options?._meta ? { _meta: options._meta } : {}),
+                method: "tools/call",
+                params: {
+                  name: toolName,
+                  arguments: isRecord(input) ? input : {},
+                  ...(options?._meta ? { _meta: options._meta } : {}),
+                },
               },
-              undefined,
+              mcpCallToolResultSchema,
               {
                 // The local deadline owns active work; the SDK bounds the total
                 // call, including one shared allowance for pending human input.
@@ -972,17 +929,19 @@ function createServerMcpRuntime(
         return session.withElicitation
           ? session.withElicitation(signal, call, holdForHumanInput)
           : call();
-      })) as CallToolResult;
+      });
       validateResult?.(result);
-      return result;
+      return toLegacyMcpCallToolResult(result);
     },
     async listTools(requestedServer, requestParams) {
       const session = await getActiveSession(requestedServer);
-      return await runGuardedMcpRequest(session, (signal) =>
-        session.client.request(
-          { method: "tools/list", params: requestParams },
-          ListToolsResultSchema,
-          { timeout: session.requestTimeoutMs, signal },
+      return toLegacyMcpListToolsResult(
+        await runGuardedMcpRequest(session, (signal) =>
+          session.client.request(
+            { method: "tools/list", params: requestParams },
+            mcpListToolsResultSchema,
+            { timeout: session.requestTimeoutMs, signal },
+          ),
         ),
       );
     },
@@ -999,8 +958,11 @@ function createServerMcpRuntime(
       return await runGuardedMcpRequest(
         session,
         (signal) =>
-          session.client.readResource(
-            { uri, ...(options?._meta ? { _meta: options._meta } : {}) },
+          session.client.request(
+            {
+              method: "resources/read",
+              params: { uri, ...(options?._meta ? { _meta: options._meta } : {}) },
+            },
             { timeout: session.requestTimeoutMs, signal },
           ),
         options,
@@ -1008,11 +970,17 @@ function createServerMcpRuntime(
     },
     async listResourceTemplates(requestedServer, requestParams) {
       const session = await getActiveSession(requestedServer);
-      return await runGuardedMcpRequest(session, (signal) =>
-        session.client.listResourceTemplates(requestParams, {
-          timeout: session.requestTimeoutMs,
-          signal,
-        }),
+      return toLegacyMcpListResourceTemplatesResult(
+        await runGuardedMcpRequest(session, (signal) =>
+          session.client.request(
+            { method: "resources/templates/list", params: requestParams },
+            mcpListResourceTemplatesResultSchema,
+            {
+              timeout: session.requestTimeoutMs,
+              signal,
+            },
+          ),
+        ),
       );
     },
     async listPrompts(requestedServer) {
@@ -1023,10 +991,13 @@ function createServerMcpRuntime(
     },
     async getPrompt(requestedServer, name, args) {
       const session = await getActiveSession(requestedServer);
-      return await runGuardedMcpRequest(session, (signal) =>
-        session.client.getPrompt(
-          { name, ...(args ? { arguments: args } : {}) },
-          { timeout: session.requestTimeoutMs, signal },
+      return toLegacyMcpGetPromptResult(
+        await runGuardedMcpRequest(session, (signal) =>
+          session.client.request(
+            { method: "prompts/get", params: { name, ...(args ? { arguments: args } : {}) } },
+            mcpGetPromptResultSchema,
+            { timeout: session.requestTimeoutMs, signal },
+          ),
         ),
       );
     },
@@ -1054,8 +1025,11 @@ function createServerMcpRuntime(
             },
           ],
         };
-        lifecycleAbortController.abort(createDisposedError(params.sessionId));
+        lifecycleAbortController.abort(
+          new Error(`bundle-mcp runtime disposed for session ${params.sessionId}`),
+        );
         catalog = null;
+        lastListedCatalog = undefined;
         catalogRetryAfterMs = undefined;
         const pendingCatalog = catalogInFlight;
         catalogInFlight = undefined;
@@ -1081,25 +1055,4 @@ function createServerMcpRuntime(
   return runtime;
 }
 
-export const testing = {
-  async resetSessionMcpRuntimeManager() {
-    await disposeAllSessionMcpRuntimes();
-    setBundleMcpCatalogListTimeoutMsForTest();
-    setBundleMcpDisposeTimeoutMsForTest();
-  },
-  getCachedSessionIds() {
-    return getSessionMcpRuntimeManagerForTesting().listSessionIds();
-  },
-  getBookkeepingSizes(manager: SessionMcpRuntimeManager): Record<string, number> {
-    const sizes = (
-      manager as SessionMcpRuntimeManager & {
-        bookkeepingSizesForTest?: () => Record<string, number>;
-      }
-    ).bookkeepingSizesForTest?.();
-    return sizes ?? {};
-  },
-  setBundleMcpCatalogListTimeoutMsForTest,
-  setBundleMcpDisposeTimeoutMsForTest,
-  mergeMcpToolCatalogs,
-};
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

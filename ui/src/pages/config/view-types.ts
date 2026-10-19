@@ -1,4 +1,4 @@
-import type { nothing, TemplateResult } from "lit";
+import type { JSX } from "@solidjs/web";
 import type { SystemInfoResult } from "../../../../packages/gateway-protocol/src/index.js";
 import type { QueueMode } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import type {
@@ -13,11 +13,12 @@ import type { ThemeCatalogSnapshot } from "../../app/theme-catalog.ts";
 import type { ThemeMode, ThemeName } from "../../app/theme.ts";
 import type { TypefaceId } from "../../app/typography.ts";
 import type { WebPushSnapshot } from "../../app/web-push.ts";
+import type { ConfigSchemaAnalysis } from "../../components/config-form.analyze.ts";
 import type { JsonSchema } from "../../components/config-form.shared.ts";
-import type { ConfigSchemaAnalysis } from "../../components/config-form.ts";
 import type { Locale } from "../../i18n/index.ts";
 import type { RealtimeTalkInputDevice } from "../chat/talk/input.ts";
 import type { SessionObserverModelSelection } from "./session-observer-settings.ts";
+import type { TabIconViewProps } from "./view-tab-icon.tsx";
 
 type SettingsMediaDeviceState = {
   devices: RealtimeTalkInputDevice[];
@@ -49,7 +50,6 @@ export type ConfigViewState = {
   envRevealed: boolean;
   validityDismissed: boolean;
   revealedSensitivePaths: Set<string>;
-  lastCustomThemeImportFocusToken: number | null;
   rawDiffCache?: RawDiffCache;
   schemaAnalysisCache?: SchemaAnalysisCache;
   lastConfigContextKey: string | null;
@@ -72,9 +72,9 @@ type AppearancePreferences = Required<
     | "composerHoldToRecord"
   >
 > &
-  Pick<UiSettings, "chatMessageMaxWidth" | "chatFollowUpMode">;
+  Pick<UiSettings, "chatMessageMaxWidth" | "chatFollowUpMode" | "openLinksInControlUiBrowser">;
 
-export type ConfigProps = AppearancePreferences & {
+export interface ConfigProps extends TabIconViewProps, AppearancePreferences {
   onAppearanceChange: (patch: Partial<AppearancePreferences>) => void;
   raw: string;
   originalRaw: string;
@@ -101,10 +101,10 @@ export type ConfigProps = AppearancePreferences & {
    *  schema section stays silent instead of claiming the page is empty. */
   embeddedEditor?: boolean;
   /** Control UI rows that belong to the active schema section but are not Gateway config. */
-  sectionPrelude?: TemplateResult;
+  sectionPrelude?: JSX.Element;
   showSectionDocs?: boolean;
   /** Curated content inside the active section; receives the canonical schema editor. */
-  renderSection?: (editor: TemplateResult | typeof nothing) => TemplateResult;
+  renderSection?: (editor: JSX.Element) => JSX.Element;
   formValue: Record<string, unknown> | null;
   activeSection: string | null;
   activeSubsection: string | null;
@@ -153,7 +153,6 @@ export type ConfigProps = AppearancePreferences & {
   customThemeImportBusy: boolean;
   customThemeImportMessage: { kind: "success" | "error"; text: string } | null;
   customThemeImportExpanded?: boolean;
-  customThemeImportFocusToken?: number;
   onCustomThemeImportUrlChange: (next: string) => void;
   onImportCustomTheme: () => void;
   onClearCustomTheme: () => void;
@@ -213,4 +212,4 @@ export type ConfigProps = AppearancePreferences & {
   onWebPushTest?: () => void;
   onWebPushSetUserPreferences?: (preferences: WebPushNotificationPreferences) => void;
   onWebPushSetDevicePreferences?: (preferences: WebPushDevicePreferences) => void;
-};
+}

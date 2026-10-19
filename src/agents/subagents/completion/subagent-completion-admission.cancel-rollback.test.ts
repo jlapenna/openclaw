@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../../test/helpers/temp-dir.js";
+import { sqliteWorkerOwnerProbe as probe } from "../../../infra/sqlite-worker-owner-probe.test-support.js";
 import { resolvePreferredOpenClawTmpDir } from "../../../infra/tmp-openclaw-dir.js";
-import { getActiveGatewayRootWorkCount } from "../../../process/gateway-work-admission.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseAsync,
@@ -16,6 +16,7 @@ import {
   mutateSubagentRuns,
 } from "../registry/subagent-registry-persistence.js";
 import { loadSubagentRegistryFromSqlite } from "../registry/subagent-registry-state.fixture.test-support.js";
+import { observeRootWork } from "../registry/subagent-registry.browser-cleanup.test-support.js";
 import {
   advanceRequesterWakeTime,
   armRequesterWake,
@@ -130,46 +131,37 @@ describe("requester wake cancellation rollback", () => {
         "not-committed",
         new Error("Stop write rejected"),
       );
-      const runWorker = stateWorker.runOpenClawStateWorkerOperation;
       let stopHeld = false;
-      vi.spyOn(stateWorker, "runOpenClawStateWorkerOperation").mockImplementation(
-        (context, operation, options) =>
-          runWorker(
-            context,
-            (scope) =>
-              operation({
-                execute: async (command, executeOptions) => {
-                  if (command.type === "subagents.persistChanges" && !stopHeld) {
-                    stopHeld = true;
-                    writerEntered.resolve();
-                    await releaseWriter.promise;
-                    throw writeFailure;
-                  }
-                  return scope.execute(command, executeOptions);
-                },
-              }),
-            options,
-          ),
-      );
+      probe.command(stateWorker, async (command, executeOptions, scope) => {
+        if (command.type === "subagents.persistChanges" && !stopHeld) {
+          stopHeld = true;
+          writerEntered.resolve();
+          await releaseWriter.promise;
+          throw writeFailure;
+        }
+        return scope.execute(command, executeOptions);
+      });
       let stopResult: Promise<PromiseSettledResult<void>[]> | undefined;
+      const settleRootWork = observeRootWork();
       try {
         await driver.run();
         driver.controller.resumeRequesterSettleWake(sibling.subagent.runId, sibling.subagent);
-        const retryAt = driver.controller.scheduledRequesterSettleWakeTimers.get(
-          input.subagent.runId,
-        )!.deadline;
         expect(driver.wake).toHaveBeenCalledOnce();
         expect(finalized).not.toHaveBeenCalled();
         stopResult = Promise.allSettled([
-          driver.controller.cancelRequesterSettleWake(input.subagent, () => {}),
+          driver.controller.retireSubagentObligations(input.subagent, () => {}, {
+            requesterNotified: true,
+          }),
         ]);
         await writerEntered.promise;
 
         // Retry callbacks cannot publish a completion while Stop owns admission.
         // The sibling reconciles the shared pending commit through its real owner.
-        await advanceRequesterWakeTime(retryAt - Date.now());
+        driver.controller.resumeRequesterSettleWake(sibling.subagent.runId, sibling.subagent);
         expect(driver.wake).toHaveBeenCalledOnce();
-        expect(getActiveGatewayRootWorkCount()).toBe(0);
+        expect(loadSubagentRegistryFromSqlite().get(input.subagent.runId)?.delivery?.status).toBe(
+          "in_progress",
+        );
         if (outcome === "delivered") {
           database.db.exec("DROP TRIGGER reject_delivered");
         } else {
@@ -200,18 +192,28 @@ describe("requester wake cancellation rollback", () => {
         releaseWriter.resolve();
         expect(await stopResult).toEqual([{ status: "rejected", reason: writeFailure }]);
         await successorWrite;
-        if (successor) {
+        // Reconcile the old cohort's receipt without admitting the independent successor.
+        await advanceRequesterWakeTime(60_000, () =>
           driver.controller.resumeRequesterSettleWake(
-            successor.runId,
-            subagentRuns.get(successor.runId)!,
-          );
-        }
-        await advanceRequesterWakeTime(60_000);
+            sibling.subagent.runId,
+            subagentRuns.get(sibling.subagent.runId)!,
+          ),
+        );
+        await settleRootWork(true);
 
-        expect(driver.wake).toHaveBeenCalledTimes(outcome === "replay budget" ? 2 : 1);
+        expect(
+          driver.wake,
+          JSON.stringify({
+            warnings: driver.warn.mock.calls,
+            wakes: driver.wake.mock.calls.map(([params]) => ({
+              runId: params.settledEntry.runId,
+              wake: params.settledEntry.requesterSettleWake,
+            })),
+          }),
+        ).toHaveBeenCalledTimes(outcome === "replay budget" ? 2 : 1);
         const stored = loadSubagentRegistryFromSqlite();
         if (owner === "current" && outcome === "delivered") {
-          expect(finalized).toHaveBeenCalledOnce();
+          expect(finalized, JSON.stringify(driver.warn.mock.calls)).toHaveBeenCalledOnce();
           for (const record of inputs) {
             expect(stored.get(record.subagent.runId)?.delivery?.status).toBe("delivered");
             expect(stored.get(record.subagent.runId)?.requesterSettleWake).toBeUndefined();
@@ -261,7 +263,8 @@ describe("requester wake cancellation rollback", () => {
         database.db.exec("DROP TRIGGER IF EXISTS reject_replay");
         releaseWriter.resolve();
         await stopResult;
-        driver.controller.clearScheduledResumeTimers();
+        await settleRootWork();
+        driver.controller.clearRuntimeState();
         await advanceRequesterWakeTime(0);
         vi.useRealTimers();
       }

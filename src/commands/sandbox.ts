@@ -5,7 +5,7 @@ import {
   removeSandboxBrowserContainer,
   removeSandboxContainer,
   type SandboxContainerInfo,
-} from "../agents/sandbox.js";
+} from "../agents/sandbox/manage.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { runWithLocalStateOwner } from "../cli/local-state-owner.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -86,7 +86,6 @@ async function recreateOwnedSandboxes(
   runtime: RuntimeEnv,
   assertCurrent: () => void,
 ): Promise<void> {
-  assertCurrent();
   const agentPrefix = `agent:${opts.agent}`;
   const matches = opts.session
     ? (item: Pick<SandboxContainerInfo, "sessionKey">) => item.sessionKey === opts.session
@@ -123,7 +122,6 @@ async function recreateOwnedSandboxes(
   runtime.log("\nRemoving sandbox runtimes...\n");
 
   let successCount = 0;
-  let failCount = 0;
   const remove = opts.browser ? removeSandboxBrowserContainer : removeSandboxContainer;
   for (const { containerName } of containers) {
     try {
@@ -133,10 +131,10 @@ async function recreateOwnedSandboxes(
       successCount++;
     } catch (err) {
       runtime.error(`Failed to remove ${containerName}: ${formatErrorMessage(err)}.`);
-      failCount++;
     }
   }
 
+  const failCount = containers.length - successCount;
   displayRecreateResult({ successCount, failCount }, runtime);
   if (failCount > 0) {
     runtime.error(

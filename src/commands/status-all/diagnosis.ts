@@ -115,7 +115,32 @@ function latestDeliveryEventAgeMs(snapshot: DeliveryDiagnosticsLike): number | n
   return latestTs > 0 ? Date.now() - latestTs : null;
 }
 
-export async function appendStatusAllDiagnosis(params: {
+export async function readStatusAllLogTails() {
+  const logPaths = (() => {
+    try {
+      // macOS supervised installs write stdout/stderr differently than node-managed gateway logs.
+      return process.platform === "darwin"
+        ? resolveGatewaySupervisorLogPaths(process.env)
+        : resolveGatewayLogPaths(process.env);
+    } catch {
+      return null;
+    }
+  })();
+  if (logPaths) {
+    const restartLogPath = resolveGatewayRestartLogPath(process.env);
+    const readStderr = process.platform !== "darwin";
+    const [stderrTail, stdoutTail, restartTail] = await Promise.all([
+      readStderr ? readFileTailLines(logPaths.stderrPath, 40).catch(() => []) : [],
+      readFileTailLines(logPaths.stdoutPath, 40).catch(() => []),
+      readFileTailLines(restartLogPath, 30).catch(() => []),
+    ]);
+    return { logPaths, restartLogPath, readStderr, stderrTail, stdoutTail, restartTail };
+  }
+  return null;
+}
+
+export function appendStatusAllDiagnosis(params: {
+  logTails: Awaited<ReturnType<typeof readStatusAllLogTails>>;
   lines: string[];
   progress: ProgressReporter;
   muted: (text: string) => string;
@@ -161,9 +186,9 @@ export async function appendStatusAllDiagnosis(params: {
   };
 
   const emitCheck = (label: string, status: "ok" | "warn" | "fail") => {
-    const icon = status === "ok" ? ok("✓") : status === "warn" ? warn("!") : fail("✗");
-    const colored = status === "ok" ? ok(label) : status === "warn" ? warn(label) : fail(label);
-    lines.push(`${icon} ${colored}`);
+    const decorate = status === "ok" ? ok : status === "warn" ? warn : fail;
+    const icon = status === "ok" ? "✓" : status === "warn" ? "!" : "✗";
+    lines.push(`${decorate(icon)} ${decorate(label)}`);
   };
   const emitUnavailableDiagnostics = (diagnostic: {
     label: string;
@@ -239,7 +264,7 @@ export async function appendStatusAllDiagnosis(params: {
   const isTrivialLastErr = lastErrClean.length < 8;
   if (lastErrClean && !isTrivialLastErr) {
     lines.push("");
-    lines.push(muted("Gateway last log line:"));
+    lines.push(muted("Recent Gateway log error (may be from an earlier run):"));
     emitDetail(redactStatusSecrets(lastErrClean));
   }
 
@@ -336,9 +361,18 @@ export async function appendStatusAllDiagnosis(params: {
     }
   }
 
-  if (!params.nodeOnlyGateway && params.deliveryDiagnostics?.ok) {
-    if (isDeliveryDiagnosticsLike(params.deliveryDiagnostics.value)) {
-      const deliveryDiagnostics = params.deliveryDiagnostics.value;
+  if (!params.nodeOnlyGateway && params.deliveryDiagnostics) {
+    const diagnostic = params.deliveryDiagnostics;
+    if (!diagnostic.ok || !isDeliveryDiagnosticsLike(diagnostic.value)) {
+      emitUnavailableDiagnostics({
+        label: "Inbound delivery telemetry",
+        detail: diagnostic.ok
+          ? "Delivery diagnostics returned an invalid response."
+          : `Delivery diagnostics failed: ${diagnostic.error}`,
+        retry: "openclaw gateway stability",
+      });
+    } else {
+      const deliveryDiagnostics = diagnostic.value;
       const received = countDeliveryEvent(deliveryDiagnostics, "message.received");
       const dispatchStarted = countDeliveryEvent(deliveryDiagnostics, "message.dispatch.started");
       const dispatchCompleted = countDeliveryEvent(
@@ -375,45 +409,12 @@ export async function appendStatusAllDiagnosis(params: {
           "Multiple gateway dispatches have not completed yet; if this persists, inspect stuck sessions or model runs.",
         );
       }
-    } else {
-      emitUnavailableDiagnostics({
-        label: "Inbound delivery telemetry",
-        detail: "Delivery diagnostics returned an invalid response.",
-        retry: "openclaw gateway stability",
-      });
     }
-  } else if (
-    !params.nodeOnlyGateway &&
-    params.deliveryDiagnostics &&
-    !params.deliveryDiagnostics.ok
-  ) {
-    emitUnavailableDiagnostics({
-      label: "Inbound delivery telemetry",
-      detail: `Delivery diagnostics failed: ${params.deliveryDiagnostics.error}`,
-      retry: "openclaw gateway stability",
-    });
   }
 
-  params.progress.setLabel("Reading logs…");
-  const logPaths = (() => {
-    try {
-      // macOS supervised installs write stdout/stderr differently than node-managed gateway logs.
-      return process.platform === "darwin"
-        ? resolveGatewaySupervisorLogPaths(process.env)
-        : resolveGatewayLogPaths(process.env);
-    } catch {
-      return null;
-    }
-  })();
-  if (logPaths) {
-    params.progress.setLabel("Reading logs…");
-    const restartLogPath = resolveGatewayRestartLogPath(process.env);
-    const readStderr = process.platform !== "darwin";
-    const [stderrTail, stdoutTail, restartTail] = await Promise.all([
-      readStderr ? readFileTailLines(logPaths.stderrPath, 40).catch(() => []) : [],
-      readFileTailLines(logPaths.stdoutPath, 40).catch(() => []),
-      readFileTailLines(restartLogPath, 30).catch(() => []),
-    ]);
+  if (params.logTails) {
+    const { logPaths, restartLogPath, readStderr, stderrTail, stdoutTail, restartTail } =
+      params.logTails;
     if (stderrTail.length > 0 || stdoutTail.length > 0) {
       lines.push("");
       lines.push(muted(`Gateway logs (tail, summarized): ${logPaths.logDir}`));

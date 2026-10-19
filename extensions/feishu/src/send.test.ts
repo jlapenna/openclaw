@@ -2,7 +2,7 @@
 import type { HttpInstance, HttpRequestOptions } from "@larksuiteoapi/node-sdk";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
-import { resolveFeishuCardTemplate } from "./native-card.js";
+import { buildFeishuAgentBody } from "./bot-agent-body.js";
 import {
   editMessageFeishu,
   getMessageFeishu,
@@ -100,6 +100,7 @@ beforeEach(() => {
   mockResolveFeishuAccount.mockReturnValue({
     accountId: "default",
     configured: true,
+    config: {},
   });
   mockCreateFeishuClient.mockReturnValue({
     im: {
@@ -130,6 +131,7 @@ describe("getMessageFeishu", () => {
         parts: [{ platformMessageId: messageId, kind: "text", index: 0, raw }],
         sentAt: result.receipt.sentAt,
         raw: [raw],
+        sourceResults: [{ channel: "feishu", messageId }],
       },
     });
   }
@@ -146,35 +148,7 @@ describe("getMessageFeishu", () => {
     });
   }
 
-  it("materializes prose soft breaks in the public post send path", async () => {
-    const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_newlines" } });
-    mockCreateFeishuClient.mockReturnValue({
-      im: {
-        message: {
-          create,
-          reply: vi.fn(),
-          get: mockClientGet,
-          list: mockClientList,
-          patch: mockClientPatch,
-        },
-      },
-    });
-
-    await sendMessageFeishu({
-      cfg: {} as ClawdbotConfig,
-      to: "oc_send",
-      text: "first line\nsecond line\n\n```ts\nconst value = 1\n```",
-    });
-
-    const request = create.mock.calls[0]?.[0] as { data?: { content?: string } } | undefined;
-    const element = JSON.parse(request?.data?.content ?? "null").zh_cn.content[0][0];
-    expect(element).toEqual({
-      tag: "md",
-      text: "first line  \nsecond line\n\n```ts\nconst value = 1\n```",
-    });
-  });
-
-  it("sends automatic mentions as native post elements without rewriting body text", async () => {
+  it("sends native mentions while preserving body mentions, prose breaks, and code fences", async () => {
     const create = vi.fn().mockResolvedValue({ code: 0, data: { message_id: "om_mentions" } });
     mockCreateFeishuClient.mockReturnValue({
       im: {
@@ -191,12 +165,12 @@ describe("getMessageFeishu", () => {
     const result = await sendMessageFeishu({
       cfg: {} as ClawdbotConfig,
       to: "oc_send",
-      text: 'body <at user_id="ou_body">Body User</at>',
+      text: 'body <at user_id="ou_body">Body User</at>\nsecond line\n\n```ts\nconst value = 1\n```',
       mentions: [{ openId: "ou_target", name: "Target User", key: "@_user_1" }],
     });
 
     expect(mockConvertMarkdownTables).toHaveBeenCalledWith(
-      'body <at user_id="ou_body">Body User</at>',
+      'body <at user_id="ou_body">Body User</at>\nsecond line\n\n```ts\nconst value = 1\n```',
       "preserve",
     );
     expect(create).toHaveBeenCalledWith({
@@ -209,7 +183,10 @@ describe("getMessageFeishu", () => {
             content: [
               [
                 { tag: "at", user_id: "ou_target", user_name: "Target User" },
-                { tag: "md", text: 'body <at user_id="ou_body">Body User</at>' },
+                {
+                  tag: "md",
+                  text: 'body <at user_id="ou_body">Body User</at>  \nsecond line\n\n```ts\nconst value = 1\n```',
+                },
               ],
             ],
           },
@@ -246,45 +223,6 @@ describe("getMessageFeishu", () => {
       config: { width_mode: "fill" },
       body: { elements: [{ tag: "markdown", content: "line one\nline two\n\nparagraph" }] },
       header: { title: { tag: "plain_text", content: "Agent" }, template: "blue" },
-    });
-  });
-
-  it("extracts text content from interactive card elements", async () => {
-    mockClientGet.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        items: [
-          {
-            message_id: "om_1",
-            chat_id: "oc_1",
-            msg_type: "interactive",
-            body: {
-              content: JSON.stringify({
-                elements: [
-                  { tag: "markdown", content: "hello markdown" },
-                  { tag: "div", text: { content: "hello div" } },
-                ],
-              }),
-            },
-          },
-        ],
-      },
-    });
-
-    const result = await getMessageFeishu({
-      cfg: {} as ClawdbotConfig,
-      messageId: "om_1",
-    });
-
-    expect(mockClientGet).toHaveBeenCalledWith({
-      params: { card_msg_content_type: "user_card_content" },
-      path: { message_id: "om_1" },
-    });
-    expectParsedMessage(result, {
-      messageId: "om_1",
-      chatId: "oc_1",
-      content: "hello markdown\nhello div",
-      contentType: "interactive",
     });
   });
 
@@ -404,47 +342,6 @@ describe("getMessageFeishu", () => {
     });
   });
 
-  it("extracts text content from post messages", async () => {
-    mockClientGet.mockResolvedValueOnce({
-      code: 0,
-      data: {
-        items: [
-          {
-            message_id: "om_post",
-            chat_id: "oc_post",
-            msg_type: "post",
-            body: {
-              content: JSON.stringify({
-                zh_cn: {
-                  title: "Summary",
-                  content: [
-                    [
-                      { tag: "text", text: "post body", style: ["bold"] },
-                      { tag: "text", text: " " },
-                      { tag: "a", text: "Docs", href: "https://example.com", style: ["italic"] },
-                    ],
-                  ],
-                },
-              }),
-            },
-          },
-        ],
-      },
-    });
-
-    const result = await getMessageFeishu({
-      cfg: {} as ClawdbotConfig,
-      messageId: "om_post",
-    });
-
-    expectParsedMessage(result, {
-      messageId: "om_post",
-      chatId: "oc_post",
-      content: "Summary\n\n**post body** *[Docs](https://example.com)*",
-      contentType: "post",
-    });
-  });
-
   it("logs a safe diagnostic (not raw content) when message content is not valid JSON", async () => {
     mockClientGet.mockResolvedValueOnce({
       code: 0,
@@ -477,6 +374,33 @@ describe("getMessageFeishu", () => {
       contentType: "text",
       content: "{bad json}",
     });
+  });
+
+  it("looks up senders only for the first 50 chronological forwarded children", async () => {
+    const children = Array.from({ length: 51 }, (_, index) => ({
+      upper_message_id: "om_lookup_limit",
+      msg_type: "text",
+      create_time: String(index),
+      sender: { id: `ou_lookup_limit_${index}` },
+      body: body({ text: `child ${index}` }),
+    })).toReversed();
+    const getUser = vi.fn(async (_request: { path: { user_id: string } }) => ({
+      data: { user: { name: "Sender" } },
+    }));
+    mockCreateFeishuClient.mockReturnValue({
+      im: { message: { get: mockClientGet } },
+      contact: { user: { get: getUser } },
+    });
+    mockClientGet.mockResolvedValueOnce(
+      page([{ message_id: "om_lookup_limit", msg_type: "merge_forward" }, ...children]),
+    );
+
+    const result = await getMessageFeishu({ cfg: {}, messageId: "om_lookup_limit" });
+    expect(getUser.mock.calls.map(([request]) => request.path.user_id)).toEqual(
+      Array.from({ length: 50 }, (_, index) => `ou_lookup_limit_${index}`),
+    );
+    expect(result?.content).toContain("... and 1 more messages");
+    expect(result?.content).not.toContain("child 50");
   });
 });
 
@@ -582,12 +506,6 @@ describe("editMessageFeishu", () => {
   });
 });
 
-describe("resolveFeishuCardTemplate", () => {
-  it("accepts supported Feishu templates", () => {
-    expect(resolveFeishuCardTemplate(" purple ")).toBe("purple");
-  });
-});
-
 const thread = { cfg: {}, threadId: "omt_1" };
 
 function page<T>(items: T[], paging: { has_more?: boolean; page_token?: string } = {}) {
@@ -601,6 +519,68 @@ function body(content: unknown) {
 function textMessage(message_id: string, text: string) {
   return { message_id, body: body({ text }) };
 }
+
+describe("fetched text mentions", () => {
+  it.each(["get", "thread", "forward"] as const)(
+    "resolves %s placeholders once using each message's flat metadata",
+    async (surface) => {
+      const text = "Meet @_user_1 then @_user_10 and @_user_1";
+      const normalized =
+        'Meet <at user_id="ou_alice">Alice @_user_10</at> then <at user_id="ou_bob">Bob &lt;Ops&gt;</at> and <at user_id="ou_alice">Alice @_user_10</at>';
+      const message = {
+        ...textMessage("om_mentions", text),
+        msg_type: "text",
+        mentions: [
+          { key: "@_user_1", id: "ou_alice", id_type: "open_id", name: "Alice @_user_10" },
+          { key: "@_user_10", id: "ou_bob", id_type: "open_id", name: "Bob <Ops>" },
+        ],
+      };
+      const items =
+        surface === "forward"
+          ? [
+              { message_id: "om_forward", msg_type: "merge_forward" },
+              { ...message, upper_message_id: "om_forward", create_time: "1000" },
+              {
+                ...textMessage("om_other", "@_user_1"),
+                msg_type: "text",
+                upper_message_id: "om_forward",
+                create_time: "2000",
+                mentions: [{ key: "@_user_1", id: "ou_other", id_type: "open_id", name: "Other" }],
+              },
+            ]
+          : [message];
+      const response = page(items);
+      const before = structuredClone(response);
+      let content: string | undefined;
+      if (surface === "thread") {
+        mockClientList.mockResolvedValueOnce(response);
+        content = (await listFeishuThreadMessages(thread))[0]?.content;
+      } else {
+        mockClientGet.mockResolvedValueOnce(response);
+        content = (
+          await getMessageFeishu({
+            cfg: {},
+            messageId: surface === "forward" ? "om_forward" : "om_mentions",
+          })
+        )?.content;
+      }
+      expect(content).toBe(
+        surface === "forward"
+          ? `[Merged and Forwarded Messages]\n- [1970-01-01T00:00:01.000Z] ${normalized}\n- [1970-01-01T00:00:02.000Z] <at user_id="ou_other">Other</at>`
+          : normalized,
+      );
+      expect(response).toEqual(before);
+      if (surface === "get") {
+        expect(
+          buildFeishuAgentBody({
+            ctx: { content: "reply", senderOpenId: "ou_sender", messageId: "om_reply" },
+            quotedContent: content,
+          }),
+        ).toBe(`[message_id: om_reply]\nou_sender: [Replying to: "${normalized}"]\n\nreply`);
+      }
+    },
+  );
+});
 
 describe("listFeishuThreadMessages", () => {
   it("reuses the same content parsing for thread history messages", async () => {

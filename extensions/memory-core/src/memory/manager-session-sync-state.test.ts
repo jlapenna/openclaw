@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { MemoryManagerSessionSyncOps } from "./manager-session-sync-ops.js";
 import {
   resolveMemorySessionStartupState,
   resolveMemorySessionSyncPlan,
 } from "./manager-session-sync-state.js";
 
 describe("memory session sync state", () => {
-  it("tracks active paths and bulk hashes without rebuilding unchanged full scans", () => {
+  it("tracks active paths and source state without rebuilding unchanged full scans", () => {
     const plan = resolveMemorySessionSyncPlan({
       needsFullReindex: false,
       files: ["/tmp/a.jsonl", "/tmp/b.jsonl"],
@@ -23,12 +24,6 @@ describe("memory session sync state", () => {
       { path: "sessions/a.jsonl", hash: "hash-a" },
       { path: "sessions/b.jsonl", hash: "hash-b" },
     ]);
-    expect(plan.existingHashes).toEqual(
-      new Map([
-        ["sessions/a.jsonl", "hash-a"],
-        ["sessions/b.jsonl", "hash-b"],
-      ]),
-    );
   });
 
   it("treats targeted session syncs as refresh-only and skips unrelated pruning", () => {
@@ -46,18 +41,14 @@ describe("memory session sync state", () => {
     expect(plan.indexAll).toBe(true);
     expect(plan.activePaths).toBeNull();
     expect(plan.existingRows).toBeNull();
-    expect(plan.existingHashes).toBeNull();
   });
 
-  it("marks identity-targeted syncs as session work", async () => {
-    const { shouldSyncSessionsForReindex } = await import("./manager-session-reindex.js");
-
+  it("marks identity-targeted syncs as session work", () => {
     expect(
-      shouldSyncSessionsForReindex({
-        hasSessionSource: true,
-        sessionsDirty: false,
-        sync: { sessions: [{ agentId: "main", sessionId: "targeted" }] },
-      }),
+      MemoryManagerSessionSyncOps.prototype["shouldSyncSessions"].call(
+        { sources: new Set(["sessions"]), sessionsDirty: false },
+        { sessions: [{ agentId: "main", sessionId: "targeted" }] },
+      ),
     ).toBe(true);
   });
 

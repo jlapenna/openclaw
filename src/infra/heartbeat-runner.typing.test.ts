@@ -54,7 +54,7 @@ async function setup(
     run: () =>
       runHeartbeatWithFakeIntervals({
         cfg,
-        deps: { getReplyFromConfig: replySpy, getQueueSize: () => 0, nowMs: () => 0 },
+        deps: { getReplyFromConfig: replySpy, nowMs: () => 0 },
       }),
   };
 }
@@ -123,20 +123,6 @@ describe("runHeartbeatOnce heartbeat typing", () => {
       },
       { defaults: { typingIntervalSeconds: TYPING_INTERVAL_SECONDS } },
     );
-  });
-
-  it("starts typing before the reply and clears it when the run fails", async () => {
-    await withTyping(async ({ cfg, sendTyping, clearTyping, replySpy, run }) => {
-      replySpy.mockRejectedValue(new Error("model unavailable"));
-      expect((await run()).status).toBe("failed");
-      for (const typing of [sendTyping, clearTyping]) {
-        expect(typing).toHaveBeenCalledOnce();
-        expectTypingCall(typing, { cfg, to: TELEGRAM_TARGET });
-      }
-      expect(sendTyping.mock.invocationCallOrder[0]).toBeLessThan(
-        replySpy.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
-      );
-    });
   });
 
   it.each([

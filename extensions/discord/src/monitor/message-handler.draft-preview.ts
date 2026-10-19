@@ -100,7 +100,6 @@ export function createDiscordDraftPreviewController(params: {
           fallbackLimit: DISCORD_TEXT_CHUNK_LIMIT,
         })
       : undefined;
-  const shouldSplitPreviewMessages = discordStreamMode === "block";
   const draftChunker = draftChunking ? new EmbeddedBlockChunker(draftChunking) : undefined;
   let lastPartialText = "";
   let draftText = "";
@@ -119,13 +118,13 @@ export function createDiscordDraftPreviewController(params: {
   const progressSeed = `${params.accountId}:${params.deliverChannelId}`;
   const progressDraft = createChannelProgressDraftCompositor({
     preparedItems: true,
-    showWorkStatus: true,
     entry: params.discordConfig,
     mode: discordStreamMode,
     active: Boolean(draftStream),
     seed: progressSeed,
     reasoningLinePrefix: "🧠 ",
     commentaryLinePrefix: "💬 ",
+    toolIcons: true,
     commentaryItalics: false,
     update: async (previewText, options) => {
       if (!draftStream) {
@@ -224,7 +223,7 @@ export function createDiscordDraftPreviewController(params: {
         draftStream?.forceNewMessage("discard");
       }
     } else {
-      if (shouldSplitPreviewMessages && hasStreamedAssistantText) {
+      if (discordStreamMode === "block" && hasStreamedAssistantText) {
         params.log("discord: calling forceNewMessage() for draft stream");
         draftStream?.forceNewMessage();
       }
@@ -293,6 +292,7 @@ export function createDiscordDraftPreviewController(params: {
       // reopening callbacks, then transfer only confirmed transport custody.
       freezeProgress();
       await withDiscordRequestAuthority(assertCurrent, async () => {
+        await info.onPlatformSendDispatch?.();
         assertCurrent();
         stream.update(text, { complete: true });
         await stream.flush();

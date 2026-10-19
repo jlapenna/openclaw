@@ -5,12 +5,13 @@ import {
   streamSegmentUsesAccumulatedText,
   type ChatStreamSegment,
 } from "../../lib/chat/chat-types.ts";
-import { streamCausalInterval, type StreamCausalBoundaryState } from "./stream-causal-boundary.ts";
+import { streamCausalInterval } from "./stream-causal-boundary.ts";
 import {
   hasAssistantStreamPartReplacement,
   visibleAssistantStreamParts,
   type ToolStreamReconciliationState,
 } from "./stream-reconciliation.ts";
+import type { ToolStreamState } from "./tool-stream-contract.ts";
 import {
   extractToolMessageRefs,
   resolveLiveToolStreamRefs,
@@ -39,39 +40,26 @@ function pruneAccumulatedStreamSegments(
   });
 }
 
-export function discardStreamSegmentIndexes(
-  state: StreamCausalBoundaryState,
-  discardedIndexes: readonly number[],
-): void {
-  if (!state.chatStreamSegments || discardedIndexes.length === 0) {
-    return;
-  }
-  const discarded = new Set(discardedIndexes);
-  state.chatStreamSegments = pruneAccumulatedStreamSegments(
-    state.chatStreamSegments,
-    state.chatRunId,
-    (_segment, index) => discarded.has(index),
-  );
-}
-
 /** A durable commentary row immediately replaces its keyed live projection.
  * Waiting for terminal cleanup renders both copies throughout the active run. */
 export function prunePersistedAssistantStreamSegments(
-  state: StreamCausalBoundaryState,
+  state: Pick<ToolStreamState, "chatStreamSegments">,
   message: unknown,
 ): void {
   const identity = readAssistantStreamSegmentIdentity(message);
-  if (!identity || !state.chatStreamSegments) {
+  if (!identity) {
     return;
   }
-  const replacedIndexes = state.chatStreamSegments.flatMap((segment, index) => {
+  const segments = state.chatStreamSegments.filter((segment) => {
     const runId = normalizeOptionalString(segment.runId);
     // Client-materialized commentary can be untagged; known run ownership
     // must still prevent a reused item id from pruning a sibling run.
     const sameRun = !identity.runId || !runId || identity.runId === runId;
-    return normalizeOptionalString(segment.itemId) === identity.itemId && sameRun ? [index] : [];
+    return normalizeOptionalString(segment.itemId) !== identity.itemId || !sameRun;
   });
-  discardStreamSegmentIndexes(state, replacedIndexes);
+  if (segments.length !== state.chatStreamSegments.length) {
+    state.chatStreamSegments = segments;
+  }
 }
 
 export function pruneHistoryReplacedStreamSegments(
@@ -82,9 +70,6 @@ export function pruneHistoryReplacedStreamSegments(
     isHiddenStreamText: StreamVisibility;
   },
 ): boolean {
-  if (!Array.isArray(state.chatStreamSegments)) {
-    return false;
-  }
   const replacedIndexes = new Set<number>();
   for (const part of visibleAssistantStreamParts(state, {
     includeCurrent: false,
@@ -125,28 +110,17 @@ export function prunePersistedToolStreamMessages(
     return;
   }
   const liveToolRefs = resolveLiveToolStreamRefs(state);
-  if (state.toolStreamById instanceof Map) {
-    for (const id of persistedToolIds) {
-      state.toolStreamById.delete(id);
-    }
+  for (const id of persistedToolIds) {
+    state.toolStreamById.delete(id);
   }
-  if (Array.isArray(state.toolStreamOrder)) {
-    state.toolStreamOrder = state.toolStreamOrder.filter(
-      (id): id is string => typeof id === "string" && !persistedToolIds.has(id),
-    );
-  }
-  if (Array.isArray(state.chatToolMessages)) {
-    state.chatToolMessages = state.chatToolMessages.filter((message) => {
-      const refs = extractToolMessageRefs(message);
-      return refs.every((ref) => {
-        const identity = resolveMatchingLiveToolIdentity(ref, liveToolRefs);
-        return identity === undefined || !persistedToolIds.has(identity);
-      });
+  state.toolStreamOrder = state.toolStreamOrder.filter((id) => !persistedToolIds.has(id));
+  state.chatToolMessages = state.chatToolMessages.filter((message) => {
+    const refs = extractToolMessageRefs(message);
+    return refs.every((ref) => {
+      const identity = resolveMatchingLiveToolIdentity(ref, liveToolRefs);
+      return identity === undefined || !persistedToolIds.has(identity);
     });
-  }
-  if (!Array.isArray(state.chatStreamSegments)) {
-    return;
-  }
+  });
   let toolIndexedSegmentIndex = 0;
   state.chatStreamSegments = pruneAccumulatedStreamSegments(
     state.chatStreamSegments,

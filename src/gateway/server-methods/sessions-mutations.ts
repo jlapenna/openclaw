@@ -18,7 +18,10 @@ import { updateSessionProfileInvolvementAsync } from "../../config/sessions/sess
 import { assignSessionOwnerInWorker } from "../../config/sessions/session-metadata-write.async.js";
 import { patchPluginSessionExtension } from "../../plugins/host-hook-state.js";
 import { isPluginJsonValue } from "../../plugins/host-hooks.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
+import {
+  captureSessionTarget,
+  runSessionMutation,
+} from "../../sessions/session-controller.lifecycle.js";
 import { resolveCurrentUserProfileDisplay } from "../current-user-profile-display.js";
 import { captureGatewayOperatorRunAuthority } from "../operator-run-authority.js";
 import { ADMIN_SCOPE } from "../operator-scopes.js";
@@ -28,6 +31,7 @@ import {
   projectAssignableSessionOwner,
   projectSessionActor,
 } from "../session-identity-projection.js";
+import { loadSessionLifecycleRuntime } from "../session-lifecycle-runtime-loader.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import { prepareSessionMutationFacts } from "../session-sharing-preparation.js";
 import {
@@ -46,8 +50,7 @@ import type { SessionPatchTargetIdentity } from "./session-unread-ack.js";
 import { startSessionPatchDiagnostics } from "./sessions-patch-diagnostics.js";
 import { executeSessionPatchMutations } from "./sessions-patch-engine.js";
 import { createCommitGuard } from "./sessions-patch-errors.js";
-import { sessionPatchTargetIdentity } from "./sessions-patch-expectations.js";
-import { loadSessionsRuntimeModule, requireSessionKey } from "./sessions-shared.js";
+import { requireSessionKey } from "./sessions-shared.js";
 import { sharingExpectedEntry } from "./sessions-sharing-authority.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
@@ -112,7 +115,7 @@ function createSessionPatchHandler(
         }
         const singlePatch = structuredClone({ ...request.params, key });
         patch = singlePatch;
-        targets = [sessionPatchTargetIdentity(singlePatch)];
+        targets = [singlePatch];
       }
       const assertCurrent = () => {
         requestAuthority.assertCurrent();
@@ -420,7 +423,14 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
         respond(
           false,
           undefined,
-          errorShape(ErrorCodes.INVALID_REQUEST, `unknown session owner "${params.owner.id}"`),
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `unknown session owner "${params.owner.id}". ${
+              params.owner.type === "human"
+                ? "Human owners require a Gateway profile ID, not a channel sender ID. Select a registered person or use Assign to me in the Control UI."
+                : "Agent owners must name a configured agent."
+            }`,
+          ),
         );
         return;
       }
@@ -460,9 +470,18 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
           );
         }
       };
-      const assignment = await runExclusiveSessionLifecycleMutation("assign-owner", {
-        scope: target.storePath,
-        identities: [target.storeKey, expectedSessionId],
+      const assignment = await runSessionMutation({
+        diagnosticLabel: "assign-owner",
+        target: captureSessionTarget({
+          storeScope: target.storePath,
+          sessionKey: target.canonicalKey,
+          aliases: [target.storeKey],
+          incarnation: expectedSessionId,
+          agentId: target.agentId,
+        }),
+        requiredSessionId: expectedSessionId,
+        policy: "allow-live",
+        signal,
         run: () =>
           assignSessionOwnerInWorker(
             { agentId: target.agentId, sessionKey: target.storeKey, storePath: target.storePath },
@@ -612,7 +631,7 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
     }
 
     const reason = p.reason === "new" ? "new" : "reset";
-    const { performGatewaySessionReset } = await loadSessionsRuntimeModule();
+    const { performGatewaySessionReset } = await loadSessionLifecycleRuntime();
     const result = await performGatewaySessionReset({
       key,
       ...(p.agentId ? { agentId: p.agentId } : {}),
@@ -636,32 +655,26 @@ export const sessionMutationHandlers: GatewayRequestHandlers = {
       return;
     }
     const deleted = "incognitoDeleted" in result;
-    if (deleted) {
-      respond(
-        true,
-        {
-          ok: true,
-          key: result.key,
-          deleted: true,
-          ...(result.worktreePreserved ? { worktreePreserved: result.worktreePreserved } : {}),
-        },
-        undefined,
-      );
-    } else {
-      respond(
-        true,
-        {
-          ok: true,
-          key: result.key,
-          entry: {
-            ...result.entry,
-            fastMode: prepareSessionFastModePresentation(client)(result.entry.fastMode),
-          },
-          resolved: result.resolved,
-        },
-        undefined,
-      );
-    }
+    respond(
+      true,
+      {
+        ok: true,
+        key: result.key,
+        ...(deleted
+          ? {
+              deleted: true,
+              ...(result.worktreePreserved ? { worktreePreserved: result.worktreePreserved } : {}),
+            }
+          : {
+              entry: {
+                ...result.entry,
+                fastMode: prepareSessionFastModePresentation(client)(result.entry.fastMode),
+              },
+              resolved: result.resolved,
+            }),
+      },
+      undefined,
+    );
     emitSessionsChanged(context, {
       sessionKey: result.key,
       agentId: result.agentId,
