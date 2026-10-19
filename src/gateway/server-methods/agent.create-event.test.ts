@@ -5,10 +5,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PreparedModelRuntimePublicationSupersededError } from "../../agents/prepared-model-runtime.errors.js";
+import { acquireAgentRunPreparedModelRuntime } from "../../agents/prepared-model-runtime.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
+import { rpcSourceTesting } from "../../sessions/session-lifecycle-admission.test-support.js";
 import { trackAsyncWork } from "../../shared/async-work-scope.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
 import {
@@ -134,8 +137,8 @@ describe("agent handler session create events", () => {
     vi.restoreAllMocks();
   });
 
-  it.each(["immediate", "deferred workspace"] as const)(
-    "retains runtime custody and emits session creation with %s preparation",
+  it.each(["immediate", "deferred workspace", "superseded catalog"] as const)(
+    "settles runtime custody with %s preparation",
     async (preparation) => {
       const caseId = preparation.replaceAll(" ", "-");
       const sessionKey = `agent:main:subagent:create-test-${caseId}`;
@@ -144,6 +147,13 @@ describe("agent handler session create events", () => {
         preparation === "deferred workspace",
       );
       vi.spyOn(sessionProject, "prepareSessionWorkspaceForRun").mockResolvedValue(undefined);
+      if (preparation === "superseded catalog") {
+        vi.mocked(acquireAgentRunPreparedModelRuntime).mockRejectedValueOnce(
+          new PreparedModelRuntimePublicationSupersededError(
+            "Accepted model catalog changed during runtime preparation",
+          ),
+        );
+      }
       const broadcastToConnIds = vi.fn();
       const respond = vi.fn();
       let execution: Promise<unknown> | undefined;
@@ -162,7 +172,6 @@ describe("agent handler session create events", () => {
             dedupe: new Map(),
             deps: {} as never,
             logGateway: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() } as never,
-            chatAbortControllers: new Map(),
             addChatRun: vi.fn(),
             registerToolEventRecipient: vi.fn(),
             getRuntimeConfig: configMocks.getRuntimeConfig,
@@ -178,6 +187,21 @@ describe("agent handler session create events", () => {
       const responseCall = firstMockCall(respond) as
         | [boolean, { status?: string; runId?: string }, unknown, { runId?: string }]
         | undefined;
+      if (preparation === "superseded catalog") {
+        expect(responseCall?.[0]).toBe(false);
+        expect(responseCall?.[2]).toMatchObject({
+          code: "UNAVAILABLE",
+          message: "Model runtime changed before this turn started. Retry the request.",
+          retryable: true,
+          retryAfterMs: 0,
+        });
+        expect(execution).toBeUndefined();
+        expect(agentIngressMocks.agentCommandFromIngress).not.toHaveBeenCalled();
+        expect(preparedRuntimeMocks.releaseDispatch).toHaveBeenCalledOnce();
+        expect(preparedRuntimeMocks.releaseSelected).not.toHaveBeenCalled();
+        expect(rpcSourceTesting.has(runId)).toBe(false);
+        return;
+      }
       expect(responseCall?.[0], JSON.stringify(responseCall)).toBe(true);
       expect(responseCall?.[1]?.status).toBe("accepted");
       expect(responseCall?.[1]?.runId).toBe(runId);
@@ -207,6 +231,7 @@ describe("agent handler session create events", () => {
           expect(call?.[3]).toEqual({
             agentId: "main",
             dropIfSlow: true,
+            sessionEventSubscriptionKeys: [sessionKey],
           });
         },
         { timeout: 2_000, interval: 5 },

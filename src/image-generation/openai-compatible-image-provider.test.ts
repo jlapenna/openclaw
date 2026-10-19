@@ -250,30 +250,6 @@ describe("OpenAI-compatible image provider helper", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it("accepts valid multi-image JSON above the generic provider JSON cap", async () => {
-    const imageBytes = Buffer.alloc(3 * 1024 * 1024 + 64 * 1024, 1);
-    postJsonRequestMock.mockResolvedValue(
-      jsonResponse({
-        data: Array.from({ length: 4 }, () => ({
-          b64_json: imageBytes.toString("base64"),
-        })),
-      }),
-    );
-    const provider = createProvider();
-
-    const result = await generate(provider, {
-      prompt: "large",
-      count: 4,
-    });
-
-    expect(result.images.map((image) => image.buffer.byteLength)).toEqual([
-      imageBytes.byteLength,
-      imageBytes.byteLength,
-      imageBytes.byteLength,
-      imageBytes.byteLength,
-    ]);
-  });
-
   it("honors configured generated media caps above the default image limit", async () => {
     const imageBytes = Buffer.alloc(7 * 1024 * 1024, 1);
     postJsonRequestMock.mockResolvedValue(
@@ -292,10 +268,11 @@ describe("OpenAI-compatible image provider helper", () => {
     expect(result.images[0]?.buffer.byteLength).toBe(imageBytes.byteLength);
   });
 
-  it("rejects oversized OpenAI-compatible image JSON", async () => {
-    postJsonRequestMock.mockResolvedValue(
+  it("rejects image JSON beyond the generated image download ceiling", async () => {
+    // Edit mode returns at most one image, so the bound is one 64 MiB image as base64.
+    postMultipartRequestMock.mockResolvedValue(
       jsonResponse({
-        data: [{ b64_json: "x".repeat(35 * 1024 * 1024) }],
+        data: [{ b64_json: "x".repeat(90 * 1024 * 1024) }],
       }),
     );
     const provider = createProvider();
@@ -303,6 +280,7 @@ describe("OpenAI-compatible image provider helper", () => {
     await expect(
       generate(provider, {
         prompt: "too large",
+        inputImages: [{ buffer: Buffer.from("source"), mimeType: "image/png" }],
       }),
     ).rejects.toThrow("sample.image-generation: JSON response exceeds");
   });

@@ -15,6 +15,7 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage, toErrorObject } from "../infra/errors.js";
 import { enablePluginInConfig } from "../plugins/enable.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { isProviderAuthChoicePlatformSupported } from "../plugins/provider-auth-choice-platform.js";
 import {
   type ProviderAuthChoiceMetadata,
@@ -32,7 +33,6 @@ import {
   supportsSetupTextInference,
 } from "./setup-inference-auth-options.js";
 import {
-  type DetectSetupInferenceDeps,
   type SetupInferenceCandidate,
   type SetupInferenceDetection,
   invalidSetupConfigError,
@@ -42,17 +42,24 @@ import {
   toProviderAutoSetupKind,
   toSavedAuthSetupKind,
 } from "./setup-inference-core.js";
+import { rankSetupInferenceCandidates } from "./setup-inference-ranking.js";
 import {
   listSetupNativeSessionCatalogs,
   requiresSetupNativeSessionCatalogConsent,
 } from "./setup-native-session-catalogs.js";
+
+function recommendSetupInferenceCandidate(
+  candidates: SetupInferenceCandidate[],
+): SetupInferenceCandidate[] {
+  const recommended = rankSetupInferenceCandidates(candidates)[0];
+  return candidates.map((candidate) => ({ ...candidate, recommended: candidate === recommended }));
+}
 
 async function listSavedSetupInferenceCandidates(params: {
   cfg: OpenClawConfig;
   agentId: string;
   workspace: string;
   choices: readonly ProviderAuthChoiceMetadata[];
-  deps: DetectSetupInferenceDeps;
   signal: AbortSignal;
 }): Promise<SetupInferenceCandidate[]> {
   const { withSetupProviderAuthMethod } = await import("./setup-provider-method.js");
@@ -62,9 +69,6 @@ async function listSavedSetupInferenceCandidates(params: {
   for (const [profileId, credential] of Object.entries(store.profiles)) {
     params.signal.throwIfAborted();
     const saved = credential.setup;
-    if (!saved && params.cfg.auth?.profiles?.[profileId]) {
-      continue;
-    }
     const choice = findSetupCredentialChoice(params.choices, credential);
     let modelRef = saved?.modelRef;
     if (!modelRef && choice) {
@@ -126,7 +130,7 @@ function resolveConfiguredCandidateKind(
   return undefined;
 }
 
-async function prepareSetupInferenceOptions(deps: DetectSetupInferenceDeps, agentId?: string) {
+async function prepareSetupInferenceOptions(agentId?: string) {
   const { readConfigFileSnapshotWithPluginMetadata } = await import("../config/config.js");
   const { snapshot, pluginMetadataSnapshot } = await readConfigFileSnapshotWithPluginMetadata();
   if (snapshot.exists && !snapshot.valid) {
@@ -135,9 +139,7 @@ async function prepareSetupInferenceOptions(deps: DetectSetupInferenceDeps, agen
   const cfg = snapshot.runtimeConfig ?? snapshot.config;
   const targetAgentId = resolveAmbientOwnerAgentId(cfg, agentId);
   const workspace = resolveSetupInferenceWorkspace(snapshot);
-  const allAuthChoices = (
-    deps.resolveManifestProviderAuthChoices ?? resolveManifestProviderAuthChoices
-  )({
+  const allAuthChoices = resolveManifestProviderAuthChoices({
     config: cfg,
     workspaceDir: workspace,
     metadataSnapshot: pluginMetadataSnapshot,
@@ -159,7 +161,7 @@ async function prepareSetupInferenceOptions(deps: DetectSetupInferenceDeps, agen
     }
   }
   const authChoices = supportedAuthChoices.filter(
-    (choice) => (deps.enablePluginInConfig ?? enablePluginInConfig)(cfg, choice.pluginId).enabled,
+    (choice) => enablePluginInConfig(cfg, choice.pluginId).enabled,
   );
   const disabledAuthChoices = supportedAuthChoices.filter(
     (choice) => !authChoices.includes(choice),
@@ -231,12 +233,18 @@ async function prepareSetupInferenceOptions(deps: DetectSetupInferenceDeps, agen
     // Declining discovery must not turn an already configured install into fresh setup.
     setupComplete,
   };
-  return { cfg, targetAgentId, authChoices, detectionRequiredProviders, manual };
+  return {
+    cfg,
+    targetAgentId,
+    authChoices,
+    detectionRequiredProviders,
+    manual,
+    pluginMetadataSnapshot,
+  };
 }
 
 /** Manual setup options use only config and manifests, never machine or credential probes. */
 export async function listManualSetupInferenceOptions(
-  deps: DetectSetupInferenceDeps = {},
   agentId?: string,
 ): Promise<
   Pick<
@@ -250,14 +258,11 @@ export async function listManualSetupInferenceOptions(
     | "utilityModel"
   >
 > {
-  return (await prepareSetupInferenceOptions(deps, agentId)).manual;
+  return (await prepareSetupInferenceOptions(agentId)).manual;
 }
 
-export async function detectSetupInference(
-  deps: DetectSetupInferenceDeps = {},
-  agentId?: string,
-): Promise<SetupInferenceDetection> {
-  const prepared = await prepareSetupInferenceOptions(deps, agentId);
+export async function detectSetupInference(agentId?: string): Promise<SetupInferenceDetection> {
+  const prepared = await prepareSetupInferenceOptions(agentId);
   let partial: SetupInferenceDetection = {
     ...prepared.manual,
     candidates: [],
@@ -270,9 +275,8 @@ export async function detectSetupInference(
   const timeoutMs = 30_000;
   return await raceWithTimeout(
     () =>
-      discoverSetupInference(prepared, deps, controller.signal, (detection) => {
+      discoverSetupInference(prepared, controller.signal, (detection) => {
         partial = detection;
-        deps.onPartial?.(detection);
       }).catch((error: unknown) => {
         // Probes run concurrently; one failure ends the detection, so stop its siblings.
         controller.abort(error);
@@ -296,8 +300,8 @@ async function discoverSetupInference(
     authChoices,
     detectionRequiredProviders,
     manual,
+    pluginMetadataSnapshot,
   }: Awaited<ReturnType<typeof prepareSetupInferenceOptions>>,
-  deps: DetectSetupInferenceDeps,
   signal: AbortSignal,
   onPartial: (detection: SetupInferenceDetection) => void,
 ): Promise<SetupInferenceDetection> {
@@ -308,7 +312,13 @@ async function discoverSetupInference(
   };
   // Provider services, saved sign-ins, and CLI version probes are independent.
   // Overlap them so cold detection waits for the slowest probe instead of their sum.
-  const appGuided = discoverAppGuidedCandidates({ cfg, workspace, authChoices, deps, signal });
+  const appGuided = discoverAppGuidedCandidates({
+    cfg,
+    workspace,
+    authChoices,
+    metadataSnapshot: pluginMetadataSnapshot,
+    signal,
+  });
   const partial: SetupInferenceDetection = {
     ...manual,
     candidates: [],
@@ -321,21 +331,20 @@ async function discoverSetupInference(
       agentId: targetAgentId,
       workspace,
       choices: authChoices,
-      deps,
       signal,
     }).then((saved) => {
       signal.throwIfAborted();
       onPartial({
         ...partial,
-        candidates: saved.filter((candidate) => !requiresDetection(candidate)),
+        candidates: recommendSetupInferenceCandidate(
+          saved.filter((candidate) => !requiresDetection(candidate)),
+        ),
       });
       return saved;
     }),
     (async () => {
-      const detect =
-        deps.detectInferenceBackends ??
-        (await import("../commands/onboard-inference.js")).detectInferenceBackends;
-      return await detect({ config: cfg, agentId: targetAgentId });
+      const { detectInferenceBackends } = await import("../commands/onboard-inference.js");
+      return await detectInferenceBackends({ config: cfg, agentId: targetAgentId });
     })(),
   ]);
   // Wait for local probes, but fail as soon as provider discovery fails.
@@ -359,8 +368,6 @@ async function discoverSetupInference(
       ),
   );
   const candidates: SetupInferenceCandidate[] = raw.map((candidate) =>
-    // Released macOS clients require this field. Keep it false so the wire
-    // contract remains decodable without expressing a provider preference.
     Object.assign(
       candidate,
       { recommended: false as const },
@@ -383,7 +390,7 @@ async function discoverSetupInference(
   const offeredCandidates = candidates.filter((candidate) => !requiresDetection(candidate));
   onPartial({
     ...partial,
-    candidates: [...offeredCandidates],
+    candidates: recommendSetupInferenceCandidate(offeredCandidates),
     ...(configuredModel ? { configuredModel } : {}),
     setupComplete: Boolean(configuredModel),
   });
@@ -400,7 +407,7 @@ async function discoverSetupInference(
   );
   return {
     ...partial,
-    candidates: offeredCandidates,
+    candidates: recommendSetupInferenceCandidate(offeredCandidates),
     ...(configuredModel ? { configuredModel } : {}),
     setupComplete: Boolean(configuredModel),
   };
@@ -410,13 +417,13 @@ async function discoverAppGuidedCandidates({
   cfg,
   workspace,
   authChoices,
-  deps,
+  metadataSnapshot,
   signal,
 }: {
   cfg: OpenClawConfig;
   workspace: string;
   authChoices: readonly ProviderAuthChoiceMetadata[];
-  deps: DetectSetupInferenceDeps;
+  metadataSnapshot?: PluginMetadataSnapshot;
   signal: AbortSignal;
 }): Promise<SetupInferenceCandidate[]> {
   const discoveryChoices = authChoices.filter(
@@ -432,9 +439,8 @@ async function discoverAppGuidedCandidates({
       config: cfg,
       workspaceDir: workspace,
       choices: discoveryChoices,
+      metadataSnapshot,
       signal,
-      enablePluginInConfig: deps.enablePluginInConfig,
-      resolvePluginProviders: deps.resolvePluginProviders,
     },
     async (choice, provider, context): Promise<SetupInferenceCandidate | null> => {
       const method = provider?.auth.find((candidate) => candidate.id === choice.methodId);

@@ -6,7 +6,6 @@ import type { OpenClawStateWorkerContext } from "../../state/openclaw-state-work
 import { runOpenClawStateWorkerOperation } from "../../state/openclaw-state-worker-store.js";
 import type {
   CronRuntimeMutationContracts,
-  CronReceiptRevisionRefusal,
   CronJobMutationRefusal,
   CronRuntimeMutationType,
   CronRuntimeWorkerOperations,
@@ -20,7 +19,6 @@ type CronRuntimeMutationParams<Type extends CronRuntimeMutationType> = {
   assertCurrent: () => void;
   publish: (outcome: CronRuntimeMutationContracts[Type]["outcome"]) => void;
   onSettled?: (outcome: "committed" | "not-committed" | "unknown") => void;
-  onRolledBackReceiptRevision?: (refusal: CronReceiptRevisionRefusal) => never;
   onRolledBackMutation?: (refusal: CronJobMutationRefusal) => never;
 };
 
@@ -28,7 +26,6 @@ type CronRuntimeMutationParams<Type extends CronRuntimeMutationType> = {
 export async function runCronRuntimeMutation<Type extends CronRuntimeMutationType>(
   params: CronRuntimeMutationParams<Type>,
 ): Promise<void> {
-  const snapshot = structuredClone(params.snapshot);
   let settled: "committed" | "not-committed" | "unknown" = "not-committed";
   const assertCurrent = () => {
     params.context.admission.assertCurrent();
@@ -42,7 +39,7 @@ export async function runCronRuntimeMutation<Type extends CronRuntimeMutationTyp
         assertCurrent();
         const command = {
           type: params.type,
-          input: { ...params.input, snapshot },
+          input: { ...params.input, snapshot: params.snapshot },
           // SAFETY: Type selects this private command's input, snapshot, and outcome together.
         } as SqliteWorkerCommand<CronRuntimeWorkerOperations>;
         settled = "unknown";
@@ -58,9 +55,7 @@ export async function runCronRuntimeMutation<Type extends CronRuntimeMutationTyp
           return;
         }
         settled = "not-committed";
-        if ("receiptRevision" in result && params.onRolledBackReceiptRevision) {
-          params.onRolledBackReceiptRevision(result.receiptRevision);
-        } else if ("mutationRefusal" in result && params.onRolledBackMutation) {
+        if ("mutationRefusal" in result && params.onRolledBackMutation) {
           params.onRolledBackMutation(result.mutationRefusal);
         } else {
           throw new Error("Cron mutation returned an unexpected refusal");

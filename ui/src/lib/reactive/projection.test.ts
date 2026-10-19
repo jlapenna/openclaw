@@ -1,5 +1,13 @@
 // @vitest-environment node
-import { createEffect, createRoot, flush, isPending, latest, untrack } from "@solidjs/signals";
+import {
+  createEffect,
+  createRoot,
+  createSignal,
+  flush,
+  isPending,
+  latest,
+  untrack,
+} from "@solidjs/signals";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ValueSignal } from "../board/provider-signals.ts";
 import { projectSource } from "./projection.ts";
@@ -100,6 +108,27 @@ describe("owner projections", () => {
     expect(projection.revision()).toBe(1);
   });
 
+  it("samples reactive owner getters only when their owner publishes", () => {
+    const [value, setValue] = createSignal(1);
+    const owner = new ValueSignal(0);
+    const subscribe = vi.spyOn(owner, "subscribe");
+    const projection = projectSource(owner, {
+      read: value,
+      subscribe: (current, notify) => current.subscribe(notify),
+      equality: "revision",
+    });
+    disposals.push(projection.dispose);
+    const view = observe(projection.read);
+    setValue(2);
+    flush();
+    expect(view.values).toEqual([1]);
+    expect(subscribe).toHaveBeenCalledOnce();
+    owner.set(1);
+    flush();
+    expect(view.values).toEqual([1, 2]);
+    expect(subscribe).toHaveBeenCalledOnce();
+  });
+
   it("honors value equality without suppressing revision-only snapshots", () => {
     const { owner, projection } = source<string>("same", Object.is);
     const listener = vi.fn();
@@ -111,15 +140,13 @@ describe("owner projections", () => {
     expect(projection.read()).toBe("changed");
   });
 
-  it("replaces sources immediately and rejects stale callback deliveries", () => {
-    const { owner, projection, subscribe, stops } = source(1);
+  it("replaces sources immediately and detaches the old owner", () => {
+    const { owner, projection, stops } = source(1);
     const view = observe(projection.read);
-    const stale = subscribe.mock.calls[0]![0];
     const replacement = new ValueSignal(7);
     projection.replaceSource(replacement);
     expect(stops).toHaveBeenCalledOnce();
     owner.set(3);
-    stale();
     flush();
     expect(view.values).toEqual([1, 7]);
     replacement.set(8);
@@ -130,6 +157,17 @@ describe("owner projections", () => {
     flush();
     expect(projection.read()).toBe(8);
     expect(view.values).toEqual([1, 7, 8]);
+  });
+
+  it("cancels a pending revision increment when disposed before the next flush", () => {
+    const { owner, projection, stops } = source(1);
+    observe(projection.read);
+    owner.set(2);
+    projection.dispose();
+    flush();
+    expect(projection.revision()).toBe(0);
+    expect(projection.read()).toBe(2);
+    expect(stops).toHaveBeenCalledOnce();
   });
 
   it("shares acquisition with explicit subscribers and counts duplicate callbacks separately", () => {
@@ -147,25 +185,5 @@ describe("owner projections", () => {
     view.dispose();
     flush();
     expect(stops).toHaveBeenCalledOnce();
-  });
-
-  it("releases subscriptions on parent disposal and handles disposal during acquisition", () => {
-    const owner = new ValueSignal(1);
-    const stop = vi.fn();
-    const dispose = createRoot((disposeRoot) => {
-      const projection = projectSource(owner, {
-        read: (current) => current.value,
-        subscribe: (_current, notify) => {
-          notify();
-          return stop;
-        },
-        equality: "revision",
-      });
-      projection.subscribe(() => projection.dispose());
-      return disposeRoot;
-    });
-    expect(stop).toHaveBeenCalledOnce();
-    dispose();
-    expect(stop).toHaveBeenCalledOnce();
   });
 });

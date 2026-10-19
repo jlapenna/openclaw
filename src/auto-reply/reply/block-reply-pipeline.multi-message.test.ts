@@ -67,7 +67,6 @@ describe("block reply pipeline multi-assistant-message suppression", () => {
       const { replyPayloads } = await buildReplyPayloads({
         payloads: [sourceBlock("Same answer", "retry", "/tmp/reused.png")],
         isHeartbeat: false,
-        didLogHeartbeatStrip: false,
         blockStreamingEnabled: route === "stream",
         blockReplyPipeline: route === "stream" ? pipeline : null,
         directBlockDeliveries:
@@ -162,7 +161,6 @@ describe("block reply pipeline multi-assistant-message suppression", () => {
       const { replyPayloads } = await buildReplyPayloads({
         payloads: [finalPayload],
         isHeartbeat: false,
-        didLogHeartbeatStrip: false,
         blockStreamingEnabled: true,
         blockReplyPipeline: pipeline,
         replyToMode: "off",
@@ -196,7 +194,6 @@ describe("block reply pipeline multi-assistant-message suppression", () => {
     const { replyPayloads } = await buildReplyPayloads({
       payloads: [setReplyPayloadMetadata({ text: "Done." }, { assistantMessageIndex: 1 })],
       isHeartbeat: false,
-      didLogHeartbeatStrip: false,
       blockStreamingEnabled: true,
       blockReplyPipeline: pipeline,
       replyToMode: "off",

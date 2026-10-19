@@ -1,5 +1,5 @@
 import { Icon } from "../../../components/solid/icon.tsx";
-import { t } from "../../../i18n/index.ts";
+import { t } from "../../../lib/reactive/i18n.ts";
 import type { FallbackStatus } from "../tool-stream-contract.ts";
 
 const FALLBACK_TOAST_DURATION_MS = 8000;
@@ -34,14 +34,21 @@ export function renderFallbackIndicatorSolid(status: FallbackStatus | null | und
     phase === "cleared"
       ? t("chat.composer.fallbackCleared", { model: status.selected })
       : t("chat.composer.fallbackActive", { model: status.active });
-  const className =
-    phase === "cleared"
-      ? "compaction-indicator compaction-indicator--fallback-cleared"
-      : "compaction-indicator compaction-indicator--fallback";
   const icon = phase === "cleared" ? <Icon name="check" /> : <Icon name="brain" />;
   return (
     <openclaw-tooltip prop:content={details}>
-      <div class={className} role="status" aria-live="polite" aria-label={details}>
+      <div
+        class={[
+          "compaction-indicator",
+          {
+            "compaction-indicator--fallback-cleared": phase === "cleared",
+            "compaction-indicator--fallback": phase !== "cleared",
+          },
+        ]}
+        role="status"
+        aria-live="polite"
+        aria-label={details}
+      >
         {icon} {message}
       </div>
     </openclaw-tooltip>

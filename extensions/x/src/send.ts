@@ -2,6 +2,7 @@ import { createChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-i
 import { createMessageReceiptFromOutboundResults } from "openclaw/plugin-sdk/channel-outbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
+import type { OutboundMediaLoadOptions } from "openclaw/plugin-sdk/outbound-media";
 import { createRuntimeConfigReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { resolveXAccount } from "./accounts.js";
 import { XAllowlistChangedError } from "./allowlist.js";
@@ -9,11 +10,13 @@ import type { XApiClient, XPost } from "./api.js";
 import { getXApi } from "./client.js";
 import type { XSenderTier } from "./guest-policy.js";
 import { resolveXIngress } from "./ingress.js";
+import { loadXMedia } from "./media.js";
 import { resolveXRecipient } from "./recipient.js";
 import { sendXReply, XPartialReplyError, type XVisibleWorkSession } from "./reply.js";
 import { getXRuntime } from "./runtime.js";
 import { XBudgetExceededError } from "./spend.js";
 import { normalizeXReplyTarget } from "./target.js";
+import { resolveXWorkOrigin } from "./work-origin.js";
 
 function rethrowReplyAuthorizationError(cause: unknown): never {
   if (cause instanceof XAllowlistChangedError) {
@@ -25,36 +28,37 @@ function rethrowReplyAuthorizationError(cause: unknown): never {
   throw cause;
 }
 
-export function xReceipt(postIds: string[], replyToId: string) {
-  return createMessageReceiptFromOutboundResults({
+export function xReceipt(postIds: string[], replyToId: string, hasMedia = false) {
+  const receipt = createMessageReceiptFromOutboundResults({
     results: postIds.map((messageId) => ({ channel: "x", messageId, conversationId: replyToId })),
     kind: "text",
     replyToId,
   });
+  if (hasMedia && receipt.parts[0]) {
+    receipt.parts[0].kind = "media";
+  }
+  return receipt;
 }
 
-export async function sendXDelivery(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-  to: string;
-  text: string;
-  mediaUrl?: string;
-  mediaUrls?: readonly string[];
-  signal?: AbortSignal;
-  mention?: XPost;
-  senderTier?: XSenderTier;
-  visibleWorkSessions?: XVisibleWorkSession[];
-  assertDirectAdapterHandoff?: () => void;
-}) {
-  if (params.mediaUrl || params.mediaUrls?.length) {
-    throw new PlatformMessageNotDispatchedError(
-      "X supports text replies only; media is not supported.",
-      {
-        cause: undefined,
-        retryable: false,
-      },
-    );
-  }
+export async function sendXDelivery(
+  params: Pick<OutboundMediaLoadOptions, "mediaAccess" | "mediaLocalRoots" | "mediaReadFile"> & {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    to: string;
+    text: string;
+    mediaUrl?: string;
+    mediaUrls?: readonly string[];
+    signal?: AbortSignal;
+    mention?: XPost;
+    senderTier?: XSenderTier;
+    visibleWorkSessions?: XVisibleWorkSession[];
+    assertDirectAdapterHandoff?: () => void;
+    sessionKey?: string | null;
+  },
+) {
+  const mediaUrls = [
+    ...new Set([...(params.mediaUrl ? [params.mediaUrl] : []), ...(params.mediaUrls ?? [])]),
+  ];
   const replyToId = normalizeXReplyTarget(params.to);
   if (!replyToId) {
     throw new PlatformMessageNotDispatchedError(
@@ -64,6 +68,9 @@ export async function sendXDelivery(params: {
   }
   const readConfig = createRuntimeConfigReader(params.cfg);
   const runtime = getXRuntime();
+  const origin = params.sessionKey
+    ? await resolveXWorkOrigin(runtime, params.sessionKey, params.cfg)
+    : undefined;
   const assertHandoff = () => {
     try {
       params.signal?.throwIfAborted();
@@ -85,7 +92,7 @@ export async function sendXDelivery(params: {
   let api: XApiClient;
   let mention: XPost;
   try {
-    account = resolveXAccount(params.cfg, params.accountId);
+    account = resolveXAccount(params.cfg, params.accountId ?? origin?.accountId);
     api = await getXApi(account.accountId, params.cfg);
     assertHandoff();
     const resolvedMention =
@@ -96,6 +103,7 @@ export async function sendXDelivery(params: {
           post: replyToId,
           userId: account.userId,
           signal: params.signal,
+          allowQuote: !origin || replyToId === origin.postId,
         })
       )?.post;
     if (!resolvedMention) {
@@ -105,6 +113,16 @@ export async function sendXDelivery(params: {
       );
     }
     mention = resolvedMention;
+    if (
+      origin &&
+      (origin.accountId !== account.accountId ||
+        (replyToId !== origin.postId && mention.conversation_id !== origin.conversationId))
+    ) {
+      throw new PlatformMessageNotDispatchedError(
+        `This X work session may reply only to its origin post (${origin.postUrl}) or a bot mention in that conversation.`,
+        { cause: undefined, retryable: false },
+      );
+    }
   } catch (cause) {
     if (cause instanceof PlatformMessageNotDispatchedError) {
       throw cause;
@@ -143,6 +161,15 @@ export async function sendXDelivery(params: {
         retryable: false,
       });
     }
+    if (mediaUrls.length && authorization.tier !== "maintainer") {
+      throw new PlatformMessageNotDispatchedError(
+        "X media replies require an allowlisted maintainer.",
+        {
+          cause: undefined,
+          retryable: false,
+        },
+      );
+    }
     const assertCurrent = () => {
       assertHandoff();
       try {
@@ -160,11 +187,18 @@ export async function sendXDelivery(params: {
     assertCurrent();
     return assertCurrent;
   };
+  // Authorize before reading local files or fetching remote attachments; the API rechecks
+  // this same authority immediately before every upload and reply request.
+  if (mediaUrls.length) {
+    await assertActive();
+  }
+  const media = await loadXMedia(mediaUrls, params, params.signal);
   const logger = runtime.logging.getChildLogger({ channel: "x", accountId: account.accountId });
   try {
     const result = await sendXReply({
       api,
       text: params.text,
+      media,
       replyToId,
       signature: account.config.replySignature,
       visibleWorkSessions: params.senderTier === "guest" ? undefined : params.visibleWorkSessions,
@@ -175,7 +209,7 @@ export async function sendXDelivery(params: {
     return {
       channel: "x" as const,
       messageId: result.postIds.at(-1) ?? "",
-      receipt: xReceipt(result.postIds, replyToId),
+      receipt: xReceipt(result.postIds, replyToId, media.length > 0),
       content: result.text,
     };
   } catch (error) {
@@ -184,7 +218,7 @@ export async function sendXDelivery(params: {
       throw createChannelPartialDeliveryError(error, {
         visibleReplySent: true,
         content: error.text,
-        receipt: xReceipt(error.postIds, replyToId),
+        receipt: xReceipt(error.postIds, replyToId, media.length > 0),
       });
     }
     throw error;

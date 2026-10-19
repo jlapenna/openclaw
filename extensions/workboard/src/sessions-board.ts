@@ -10,7 +10,6 @@ import { resolveGlobalSingleton } from "openclaw/plugin-sdk/global-singleton";
 import type { OpenClawPluginApi, OpenClawPluginService } from "../api.js";
 import { sessionMatchesColumn, sessionsBoardFallback } from "./sessions-board-rules.js";
 import type { WorkboardBoardStore } from "./store-boards.js";
-import { freezeCardList } from "./store-read.js";
 
 type Gateway = Pick<
   OpenClawPluginApi["runtime"]["gateway"],
@@ -48,7 +47,6 @@ type SourceRow = SourceSnapshot["sessions"][number];
 type Placements = Awaited<ReturnType<WorkboardBoardStore["listSessionPlacements"]>>;
 type CachedFacts = {
   source: SourceRow;
-  redactionRevision: SourceSnapshot["redactionRevision"];
   facts: WorkboardSessionFacts;
   stale?: boolean;
   pin?: Placements[number];
@@ -103,40 +101,23 @@ function inScope(facts: WorkboardSessionFacts, board: WorkboardSessionsBoard, no
   );
 }
 
-function retainSessionState(
-  previous: WorkboardSessionFacts,
-  current: WorkboardSessionFacts,
-): WorkboardSessionFacts {
-  const facts: WorkboardSessionFacts = {
-    ...current,
-    lifecycleRevision: previous.lifecycleRevision,
-    run: previous.run,
-    archived: previous.archived,
-    lastActivityAt: previous.lastActivityAt,
-    observerDigest: previous.observerDigest
-      ? {
-          health: previous.observerDigest.health,
-          headline: "",
-          revision: previous.observerDigest.revision,
-        }
-      : undefined,
-    pullRequests: previous.pullRequests.map(({ number, state, url }) => ({
-      number,
-      state,
-      ...(url ? { url } : {}),
-    })),
-    pullRequestsUnavailable: previous.pullRequestsUnavailable,
-    pullRequestsRateLimited: previous.pullRequestsRateLimited,
-  };
-  freezeCardList(facts);
-  return facts;
-}
-
 function createOwner(
   params: SessionsBoardServiceParams,
   context: ParametersOfStart,
   isCurrent: () => boolean,
 ): Owner {
+  const readiness = params.store.repairSessionPlacements().then((repaired) => {
+    if (repaired.placements) {
+      context.logger.info(`Sessions board removed ${repaired.placements} non-operator placements.`);
+    }
+    if (repaired.boards) {
+      context.logger.info(`Sessions board updated default rules on ${repaired.boards} boards.`);
+    }
+  });
+  void readiness.catch((error: unknown) => {
+    context.serviceHealth?.reportFailure(error);
+    context.logger.error(`Sessions board initialization failed: ${String(error)}`);
+  });
   const lastKnown = new Map<string, CachedFacts>();
   const projections = new Map<string, PreparedProjection>();
   const boards = new Map<string, Promise<WorkboardSessionsBoard>>();
@@ -179,13 +160,10 @@ function createOwner(
     board: WorkboardSessionsBoard,
     source: SourceSnapshot,
     placements: Map<string, Placements[number]>,
-    admittedRevision: typeof revision,
     preparedFacts?: Map<string, CachedFacts>,
   ) => {
-    if (params.store.sessionsRevision === admittedRevision) {
-      for (const key of source.missingSessionKeys ?? []) {
-        lastKnown.delete(key);
-      }
+    for (const key of source.missingSessionKeys ?? []) {
+      lastKnown.delete(key);
     }
     const unavailable = new Set<string>();
     const reasons = new Set<string>();
@@ -200,7 +178,6 @@ function createOwner(
       const previous = preparedFacts?.get(row.key);
       if (
         previous?.source === row &&
-        previous.redactionRevision === source.redactionRevision &&
         !row.unavailable &&
         isDeepStrictEqual(previous.pin, placements.get(row.key))
       ) {
@@ -210,7 +187,6 @@ function createOwner(
       const { isMain: _isMain, unavailable: failure, pullRequestsStale: _stale, ...facts } = row;
       const current: CachedFacts = {
         source: row,
-        redactionRevision: source.redactionRevision,
         facts,
       };
       if (failure) {
@@ -218,18 +194,14 @@ function createOwner(
         reasons.add(failure);
         const previousFacts = lastKnown.get(row.key);
         const known = previousFacts?.facts.sessionId === row.sessionId ? previousFacts : undefined;
-        current.facts = !known
-          ? facts
-          : known.redactionRevision === source.redactionRevision
-            ? known.facts
-            : retainSessionState(known.facts, facts);
+        current.facts = known ? known.facts : facts;
         current.stale = known?.stale;
       } else {
         current.stale = row.pullRequestsStale;
       }
       resolved.set(row.key, current);
       // Concurrent reads may leave an older fallback until the next successful refresh.
-      if (!failure && params.store.sessionsRevision === admittedRevision) {
+      if (!failure) {
         lastKnown.set(row.key, current);
       }
     }
@@ -263,7 +235,7 @@ function createOwner(
       const match = known
         ? board.sessions.columns.find((column) => sessionMatchesColumn(ruleFacts, column))
         : undefined;
-      const placed = Object.freeze({
+      const placed = {
         ...facts,
         columnId: pinned ? pin.columnId : (match ?? fallback).id,
         source: pinned ? ("operator" as const) : ("state" as const),
@@ -274,7 +246,7 @@ function createOwner(
             : match
               ? "Matched column rules"
               : "fallback",
-      });
+      };
       sessions.push(placed);
       resolved.set(key, { ...cached, pin, row: placed });
     }
@@ -294,7 +266,6 @@ function createOwner(
         `Pull-request facts for ${count} ${count === 1 ? "session" : "sessions"} are ${reason}.`,
       );
     }
-    Object.freeze(sessions);
     return {
       complete: unavailable.size === 0 && !source.missingSessionKeys?.length,
       facts: resolved,
@@ -313,6 +284,7 @@ function createOwner(
     caller?: CallerAuthority,
   ): Promise<WorkboardSessionsBoardRead> => {
     const assertReadCurrent = interactiveAuthority(caller);
+    await readiness;
     assertReadCurrent();
     hasRead = true;
     if (revision !== params.store.sessionsRevision) {
@@ -322,18 +294,13 @@ function createOwner(
     const admittedRevision = revision;
     let boardRead = boards.get(id);
     if (!boardRead) {
-      boardRead = params.store.getSessionsBoard(id).then((board) => {
-        freezeCardList(board);
-        return board;
-      });
+      boardRead = params.store.getSessionsBoard(id);
       if (boards.size >= 64) {
         boards.delete(boards.keys().next().value!);
       }
       boards.set(id, boardRead);
       void boardRead.catch(() => {
-        if (boards.get(id) === boardRead) {
-          boards.delete(id);
-        }
+        boards.delete(id);
       });
     }
     const board = await boardRead;
@@ -341,10 +308,8 @@ function createOwner(
     return params.gateway.withSessionFacts(sessionSelection(board, view), async (source) => {
       assertReadCurrent();
       const key = JSON.stringify([id, view, source.scope ?? source.revision]);
-      const current = projections.get(key);
-      const cacheable = params.store.sessionsRevision === admittedRevision;
       const admittedAt = now();
-      const previous = cacheable ? current : undefined;
+      const previous = projections.get(key);
       let projection = previous;
       if (
         projection &&
@@ -354,7 +319,6 @@ function createOwner(
       ) {
         projection = undefined;
       }
-      const joined = Boolean(projection);
       if (!projection) {
         const prepared: PreparedProjection = {
           revision: admittedRevision,
@@ -374,7 +338,6 @@ function createOwner(
               board,
               source,
               new Map(placements.map((pin) => [pin.sessionKey, pin])),
-              admittedRevision,
               isDeepStrictEqual(previous?.board.sessions.columns, board.sessions.columns)
                 ? previous?.facts
                 : undefined,
@@ -385,39 +348,28 @@ function createOwner(
               prepared.expires,
             );
             prepared.facts = complete ? facts : undefined;
-            const snapshot = Object.freeze({
+            const snapshot = {
               ...result,
-              revision: Object.freeze({ ...admittedRevision, boardId: id, scope: randomUUID() }),
-            });
+              revision: { ...admittedRevision, boardId: id, scope: randomUUID() },
+            };
             return { snapshot, complete };
           }),
         };
-        if (cacheable) {
-          if (projections.size >= 64) {
-            projections.delete(projections.keys().next().value!);
-          }
-          projections.set(key, prepared);
+        if (projections.size >= 64) {
+          projections.delete(projections.keys().next().value!);
         }
+        projections.set(key, prepared);
         projection = prepared;
       }
       try {
         const { snapshot, complete } = await projection.read;
         assertReadCurrent();
-        const expired = projection.expires < admittedAt;
-        if (
-          (!complete || expired || params.store.sessionsRevision !== admittedRevision) &&
-          projections.get(key) === projection
-        ) {
+        if (!complete || params.store.sessionsRevision !== admittedRevision) {
           projections.delete(key);
-        }
-        if (joined && expired) {
-          return await read(id, view, caller);
         }
         return snapshot;
       } catch (error) {
-        if (projections.get(key) === projection) {
-          projections.delete(key);
-        }
+        projections.delete(key);
         assertReadCurrent();
         throw error;
       }
@@ -439,9 +391,11 @@ function createOwner(
     cancel,
     async stop() {
       cancel();
+      await readiness.catch(() => {});
     },
     async update(id, patch, caller) {
       const assertWriteCurrent = interactiveAuthority(caller);
+      await readiness;
       assertWriteCurrent();
       return await params.store.updateSessionsBoard(id, patch, assertWriteCurrent);
     },
@@ -512,15 +466,6 @@ export function createWorkboardSessionsBoardService(
       const state = activeState();
       await state.owner?.stop();
       state.owner = undefined;
-      const repaired = await params.store.repairSessionPlacements();
-      if (repaired.placements) {
-        context.logger.info(
-          `Sessions board removed ${repaired.placements} non-operator placements.`,
-        );
-      }
-      if (repaired.boards) {
-        context.logger.info(`Sessions board updated default rules on ${repaired.boards} boards.`);
-      }
       const owner = createOwner(params, context, () => activeState().owner === owner);
       owned = state.owner = owner;
     },

@@ -117,6 +117,8 @@ export function createControlUiSessionPullRequestSubscriptions(deps: Subscriptio
   >();
   const scheduler = deps.scheduler.scope();
   const limit = pLimit(CONTROL_UI_SESSION_PR_LOAD_CONCURRENCY);
+  // Loads revalidate watchers while holding a slot, so reads use their own bounded queue.
+  const limitReads = pLimit(CONTROL_UI_SESSION_PR_LOAD_CONCURRENCY);
   const customLoad = deps.load;
   const load = customLoad ?? loadSessionPullRequests;
   const withSource = <T>(
@@ -199,7 +201,9 @@ export function createControlUiSessionPullRequestSubscriptions(deps: Subscriptio
   const currentWatcher = async (connId: string, sessionKey: string) => {
     const watched = subscriptions.get(connId)?.get(sessionKey);
     const target =
-      deps.isConnectionActive?.(connId) === false ? undefined : await watched?.readCurrent();
+      deps.isConnectionActive?.(connId) === false
+        ? undefined
+        : await limitReads(() => watched?.readCurrent());
     const subscription = subscriptions.get(connId);
     if (scope.isClosing || subscription?.get(sessionKey) !== watched) {
       return undefined;
@@ -504,11 +508,12 @@ export function createControlUiSessionPullRequestSubscriptions(deps: Subscriptio
               ? { sessionKey: "global", agentId: parsed.agentId }
               : { sessionKey: key };
           const previous = previousSubscription?.get(key);
-          const readCurrent =
-            previous && (await previous.readCurrent())
-              ? previous.readCurrent
-              : await deps.prepareRead(normalizedConnId, session);
-          const target = await readCurrent?.();
+          let readCurrent = previous?.readCurrent;
+          let target = await readCurrent?.();
+          if (!target) {
+            readCurrent = await deps.prepareRead(normalizedConnId, session);
+            target = await readCurrent?.();
+          }
           if (!readCurrent || !target) {
             continue;
           }
