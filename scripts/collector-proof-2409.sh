@@ -20,8 +20,19 @@ npm install --prefix "$task_root/toolchain" --ignore-scripts --no-audit --no-fun
 export PATH="$task_root/toolchain/node_modules/.bin:$PATH"
 cd source
 pnpm install --frozen-lockfile --store-dir "$task_root/pnpm-store"
-# Compile before loading model weights so build and inference peaks do not overlap.
-pnpm openclaw --version
+# Use the owner's self-contained package path, then retire the build workspace.
+# Build dependencies and model weights must not occupy the work volume together.
+node scripts/package-openclaw-for-docker.mjs --output-dir "$task_root/package" \
+  --output-name openclaw-proof.tgz --allow-unreleased-changelog --bundle-plugin openai
+cd "$task_root"
+test -s "$task_root/package/openclaw-proof.tgz"
+sha256sum "$task_root/package/openclaw-proof.tgz"
+test "$(git -C "$task_root/source" rev-parse HEAD)" = "$task_head"
+rm -rf -- "$task_root/source" "$task_root/pnpm-store" "$task_root/npm-cache"
+npm install --prefix "$task_root/runtime" --omit=dev --no-audit --no-fund \
+  "$task_root/package/openclaw-proof.tgz"
+export OPENCLAW_PROOF_CLI="$task_root/runtime/node_modules/.bin/openclaw"
+"$OPENCLAW_PROOF_CLI" --version
 
 cd "$task_root"
 curl -fsSL -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b11803/llama-b11803-bin-ubuntu-x64.tar.gz
@@ -61,13 +72,13 @@ for task_try in {1..90}; do
 done
 curl -fsS http://127.0.0.1:18801/health > /dev/null
 printf 'PROOF model=Qwen3-1.7B-Q8_0 revision=90862c4b9d2787eaed51d12237eafdfe7c5f6077 server=b11803 ready=true\n'
-cd "$task_root/source"
-pnpm openclaw gateway run --port 18791 --allow-unconfigured > "$task_root/gateway.log" 2>&1 &
+cd "$task_root"
+"$OPENCLAW_PROOF_CLI" gateway run --port 18791 --allow-unconfigured > "$task_root/gateway.log" 2>&1 &
 task_gateway_pid=$!
 for task_try in {1..120}; do
-  if pnpm openclaw gateway call health --json > "$task_root/health.json" 2> /dev/null; then break; fi
+  if "$OPENCLAW_PROOF_CLI" gateway call health --json > "$task_root/health.json" 2> /dev/null; then break; fi
   kill -0 "$task_gateway_pid"
   sleep 2
 done
-pnpm openclaw gateway call health --json > "$task_root/health.json"
+"$OPENCLAW_PROOF_CLI" gateway call health --json > "$task_root/health.json"
 python3 "$task_root/collector-proof-2409.py" run
