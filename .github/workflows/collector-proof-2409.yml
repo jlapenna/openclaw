@@ -24,9 +24,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
-        with:
-          node-version: 24.x
       - name: Run secretless proof within one runner
         shell: bash
         run: |
@@ -45,17 +42,21 @@ jobs:
           sudo chown -R nobody:nogroup "$task_proof_root"
           wc -c "$task_proof_root"/collector-proof-2409.{sh,py}
           sudo -u nobody test -s "$task_proof_root/collector-proof-2409.sh"
-          /usr/bin/systemd-run --version | head -1
-          trap 'sudo systemctl stop collector-proof-2409.service || true; sudo umount /mnt/collector-proof-2409 || true' EXIT
-          sudo /usr/bin/systemd-run --unit=collector-proof-2409 --wait --pipe \
-            -p User=nobody -p Group=nogroup -p CPUQuota=300% \
-            -p MemoryMax=10G -p MemorySwapMax=0 -p TasksMax=512 \
-            -p RuntimeMaxSec=1950 -p NoNewPrivileges=true -p ProtectHome=true \
-            -p ProtectSystem=strict -p PrivateTmp=true -p PrivateDevices=true \
-            -p "ReadWritePaths=$task_proof_root" -p "WorkingDirectory=$task_proof_root" \
-            /usr/bin/env -i "PATH=$PATH" HOME="$task_proof_root/home" \
-            CI=1 /bin/bash "$task_proof_root/collector-proof-2409.sh"
-          sudo systemctl show collector-proof-2409.service -p ExecMainStatus -p Result -p CPUUsageNSec -p MemoryPeak || true
+          trap 'docker stop --time 10 collector-proof-runtime 2>/dev/null || true; docker rm collector-proof-tools 2>/dev/null || true; sudo umount /mnt/collector-proof-2409 || true' EXIT
+          task_node_image=node:24-trixie-slim@sha256:e79437bb05061f860be420634f676f4394619028df216d4b9361966d7fcc7a14
+          docker pull "$task_node_image"
+          # Toolchain preparation is separate from the larger runtime envelope.
+          docker run --name collector-proof-tools --cpus 1 --memory 1g --memory-swap 1g \
+            --pids-limit 256 "$task_node_image" bash -euc \
+            'apt-get update -qq; apt-get install -y --no-install-recommends ca-certificates curl git python3 zstd libgomp1; rm -rf /var/lib/apt/lists/*'
+          docker commit collector-proof-tools collector-proof-runtime:local
+          docker rm collector-proof-tools
+          timeout --signal=TERM --kill-after=15s 31m docker run --rm --name collector-proof-runtime \
+            --init --read-only --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+            --cpus 3 --memory 10g --memory-swap 10g --pids-limit 512 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m --volume "$task_proof_root:/proof:rw" \
+            --workdir /proof --env HOME=/proof/home --env CI=1 \
+            collector-proof-runtime:local /bin/bash /proof/collector-proof-2409.sh
           python3 - "$task_proof_root/result.json" <<'PY'
           import json,sys
           with open(sys.argv[1]) as f:
