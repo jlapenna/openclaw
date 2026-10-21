@@ -1,0 +1,54 @@
+name: Temporary collected-cron runtime proof
+
+on:
+  push:
+    branches: [proof/2409-silent-collector-01a15ec0]
+    paths:
+      - .github/workflows/collector-proof-2409.yml
+      - scripts/collector-proof-2409.sh
+      - scripts/collector-proof-2409.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collector-proof-2409
+  cancel-in-progress: true
+
+jobs:
+  runtime-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.x
+      - name: Run secretless proof within one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public standard runner: 4 CPUs, 16 GB RAM, 14 GB free storage.
+          # Reserve one CPU, >5 GB RAM and >4 GB storage for the host.
+          test "$(nproc)" -ge 4
+          test "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -ge 15000000
+          test "$(df --output=avail -B1 "$RUNNER_TEMP" | tail -1)" -ge 14000000000
+          task_proof_root=/mnt/collector-proof-2409
+          sudo truncate -s 9G "$RUNNER_TEMP/collector-proof.img"
+          sudo mkfs.ext4 -q "$RUNNER_TEMP/collector-proof.img"
+          sudo mkdir -p "$task_proof_root"
+          sudo mount -o loop "$RUNNER_TEMP/collector-proof.img" "$task_proof_root"
+          sudo cp scripts/collector-proof-2409.{sh,py} "$task_proof_root/"
+          sudo chown -R nobody:nogroup "$task_proof_root"
+          trap 'sudo systemctl stop collector-proof-2409.service || true; sudo umount /mnt/collector-proof-2409 || true' EXIT
+          sudo systemd-run --unit=collector-proof-2409 --wait --pipe --collect \
+            -p User=nobody -p Group=nogroup -p CPUQuota=300% \
+            -p MemoryMax=10G -p MemorySwapMax=0 -p TasksMax=512 \
+            -p RuntimeMaxSec=1950 -p NoNewPrivileges=true -p ProtectHome=true \
+            -p ProtectSystem=strict -p PrivateTmp=true -p PrivateDevices=true \
+            -p "ReadWritePaths=$task_proof_root" -p "WorkingDirectory=$task_proof_root" \
+            /usr/bin/env -i "PATH=$PATH" HOME="$task_proof_root/home" \
+            CI=1 /bin/bash "$task_proof_root/collector-proof-2409.sh"
