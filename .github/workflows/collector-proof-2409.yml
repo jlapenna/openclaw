@@ -43,8 +43,11 @@ jobs:
           sudo mount -o loop "$RUNNER_TEMP/collector-proof.img" "$task_proof_root"
           sudo cp scripts/collector-proof-2409.{sh,py} "$task_proof_root/"
           sudo chown -R nobody:nogroup "$task_proof_root"
+          wc -c "$task_proof_root"/collector-proof-2409.{sh,py}
+          sudo -u nobody test -s "$task_proof_root/collector-proof-2409.sh"
+          /usr/bin/systemd-run --version | head -1
           trap 'sudo systemctl stop collector-proof-2409.service || true; sudo umount /mnt/collector-proof-2409 || true' EXIT
-          sudo systemd-run --unit=collector-proof-2409 --wait --pipe --collect \
+          sudo /usr/bin/systemd-run --unit=collector-proof-2409 --wait --pipe \
             -p User=nobody -p Group=nogroup -p CPUQuota=300% \
             -p MemoryMax=10G -p MemorySwapMax=0 -p TasksMax=512 \
             -p RuntimeMaxSec=1950 -p NoNewPrivileges=true -p ProtectHome=true \
@@ -52,3 +55,13 @@ jobs:
             -p "ReadWritePaths=$task_proof_root" -p "WorkingDirectory=$task_proof_root" \
             /usr/bin/env -i "PATH=$PATH" HOME="$task_proof_root/home" \
             CI=1 /bin/bash "$task_proof_root/collector-proof-2409.sh"
+          sudo systemctl show collector-proof-2409.service -p ExecMainStatus -p Result -p CPUUsageNSec -p MemoryPeak || true
+          python3 - "$task_proof_root/result.json" <<'PY'
+          import json,sys
+          with open(sys.argv[1]) as f:
+              proof=json.load(f)
+          assert proof['cron_status']=='ok' and proof['completion_status']=='succeeded'
+          assert proof['accepted_collectors']==proof['collected_successfully']==1
+          assert proof['pending']==[] and proof['final']=='NO_REPLY' and proof['delivered'] is False
+          print('PROOF_VERIFIED '+json.dumps(proof))
+          PY

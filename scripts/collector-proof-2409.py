@@ -132,6 +132,7 @@ def run():
     assert proof["final"] == "NO_REPLY" and proof["marker"] == MARKER, proof
     assert proof["cron_status"] == "ok" and not proof["error"], proof
     assert proof["completion_status"] == "succeeded" and proof["delivered"] is False, proof
+    (ROOT / "result.json").write_text(json.dumps(proof))
 
 
 if __name__ == "__main__":
