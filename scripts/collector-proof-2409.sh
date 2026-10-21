@@ -23,7 +23,7 @@ pnpm install --frozen-lockfile --store-dir "$task_root/pnpm-store"
 # Use the owner's self-contained package path, then retire the build workspace.
 # Build dependencies and model weights must not occupy the work volume together.
 node scripts/package-openclaw-for-docker.mjs --output-dir "$task_root/package" \
-  --output-name openclaw-proof.tgz --allow-unreleased-changelog --bundle-plugin openai
+  --output-name openclaw-proof.tgz --allow-unreleased-changelog
 cd "$task_root"
 test -s "$task_root/package/openclaw-proof.tgz"
 sha256sum "$task_root/package/openclaw-proof.tgz"
