@@ -69,7 +69,7 @@ describe("automation plugin reload recovery", () => {
 
   it("refreshes a cached runtime whose hook plugin was replaced without retiring the registry", async () => {
     // Per-plugin replacement disposes the replaced instance while the cached
-    // registry is still retained, so it is never marked retired (homelab#2881).
+    // registry is still retained, so it is never marked retired.
     ensureGlobalHookRunner();
     let generation = 0;
     const guarded: number[] = [];

@@ -430,16 +430,15 @@ function createCronCodeModeRunner(deps: CronTriggerEvaluatorDeps) {
     const promise = prepareRuntime({ ...request, signal: scope.signal }).then((runtime) => {
       entry.lifetime.publish(runtime);
       const registry = runtime.pluginRegistry;
-      const registryCurrent = registry
-        ? (capturePluginLifecycleAuthority(registry, undefined, { scopedRuntime: true }) ??
-          (() => false))
-        : () => true;
+      const registryCurrent =
+        registry && capturePluginLifecycleAuthority(registry, undefined, { scopedRuntime: true });
       return {
         ...runtime,
         // Per-plugin replacement disposes one instance without retiring this
         // retained registry; its stale hooks would fail every later tool call.
         isCurrent: () =>
-          registryCurrent() && (!registry || isPluginRegistryRecordSetAdmitting(registry)),
+          !registry ||
+          (registryCurrent?.() === true && isPluginRegistryRecordSetAdmitting(registry)),
       };
     });
     const entry: TriggerRuntimeCacheEntry = {
