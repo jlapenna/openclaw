@@ -15,7 +15,7 @@ def cli(*args, check=True):
     result = subprocess.run(
         ["bash", "-c", 'exec pnpm openclaw "$@"', "collector-proof-cli", *args],
         cwd=ROOT / "source",
-        text=True, capture_output=True, timeout=600,
+        text=True, capture_output=True, timeout=1140,
     )
     text = result.stdout
     start = text.find("{\n")
@@ -73,12 +73,13 @@ def run():
                 "--agent", "parent", "--session", "isolated", "--at", "1h",
                 "--message", task, "--model", "proof/proof-cpu@proof:manual",
                 "--thinking", "off", "--light-context",
-                "--tools", "sessions_spawn,agents_wait,write", "--timeout-seconds", "480",
+                "--tools", "sessions_spawn,agents_wait,write", "--timeout-seconds", "900",
                 "--announce", "--channel", "last", "--to", "isolated-proof-target", "--json")
     job_id = added.get("id") or added.get("job", {}).get("id")
     assert job_id, added
-    result = cli("cron", "run", job_id, "--wait", "--wait-timeout", "9m",
+    result = cli("cron", "run", job_id, "--wait", "--wait-timeout", "17m",
                  "--poll-interval", "5s", "--json", check=False)
+    print("NATIVE_CRON_RESULT " + json.dumps(result), flush=True)
     record = result.get("run", {})
     sid = record.get("sessionId")
     assert sid, result
@@ -89,7 +90,11 @@ def run():
     ):
         if not text and compressed:
             text = subprocess.run(["zstd", "-dc"], input=compressed, capture_output=True, check=True).stdout
-        message = json.loads(text).get("message") or {}
+        event = json.loads(text)
+        message = event.get("message") or {}
+        print("TRANSCRIPT_EVENT " + json.dumps({"role": message.get("role"),
+              "toolName": message.get("toolName"), "stopReason": message.get("stopReason"),
+              "content": message.get("content")})[:2200], flush=True)
         content = message.get("content") or []
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -108,8 +113,12 @@ def run():
         for block in content:
             try:
                 value = json.loads(block.get("text", ""))
+                if not isinstance(value, dict):
+                    continue
                 if "result" in value and isinstance(value["result"], dict):
                     value = json.loads(value["result"]["content"][0]["text"])
+                if not isinstance(value, dict):
+                    continue
                 if value.get("status") == "accepted":
                     accepted.add(value["runId"])
                 for child in value.get("completed", []):

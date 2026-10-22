@@ -50,7 +50,7 @@ cleanup() {
   if [[ "$task_status" -ne 0 ]]; then
     for task_log in "$task_root/gateway.log" "$task_root/model.log"; do
       if [[ -f "$task_log" ]]; then
-        grep -Ei 'invalid|error|failed|fatal|exception' "$task_log" | tail -10 || true
+        tail -60 "$task_log"
       fi
     done
   fi
