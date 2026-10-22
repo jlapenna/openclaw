@@ -55,7 +55,7 @@ def configure():
     }))
     shutil.copyfile(ROOT / "hook-replacement-proof-2881.mjs", plugin / "index.js")
     (ROOT / "scheduled.js").write_text(
-        "const r = await exec({command: 'printf HOOK_EXEC_2881', timeout: 10, yieldMs: 1000});\n"
+        "const r = await exec({command: 'printf HOOK_EXEC_2881', timeoutSeconds: 10, yieldMs: 1000});\n"
         "if (r.status !== 'completed' || r.exitCode !== 0 || r.aggregated.trim() !== 'HOOK_EXEC_2881') "
         "throw new Error('Actual exec failed: ' + JSON.stringify(r));\n"
         "const runs = (trigger.state?.runs ?? 0) + 1;\n"
