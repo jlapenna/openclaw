@@ -10,7 +10,8 @@ export PNPM_HOME="$task_root/toolchain/bin"
 export NODE_OPTIONS=--max-old-space-size=7168
 mkdir -p "$HOME" "$TMPDIR" "$XDG_CACHE_HOME" "$PNPM_HOME"
 task_head=eeb921936223874e20c3c5a2c0cd6104373e92fe
-printf 'PROOF source=%s cpu_max=3 memory_max=10GiB work_volume=9GiB gpu=none\n' "$task_head"
+printf 'PROOF source=%s cpu_max=3 memory_max=10GiB work_volume=12GB gpu=none\n' "$task_head"
+trap 'df -B1 "$task_root"; du -sh "$task_root"/* 2>/dev/null || true' ERR
 node --version
 git init -q source
 git -C source fetch -q --depth=1 https://github.com/openclaw/openclaw.git "$task_head"

@@ -29,13 +29,15 @@ jobs:
         run: |
           set -euo pipefail
           # Public standard runner: 4 CPUs, 16 GB RAM, 14 GB free storage.
-          # Reserve one CPU, >5 GB RAM and >4 GB storage for the host.
+          # Envelope: 3 CPUs, 10 GiB RAM, 12 GB work volume; no accelerator.
+          # Reserve one CPU, 3 GB RAM and 2 GB storage on the same runner.
           test "$(nproc)" -ge 4
           test "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -ge 15000000
           test "$(df --output=avail -B1 "$RUNNER_TEMP" | tail -1)" -ge 14000000000
           task_proof_root=/mnt/collector-proof-2409
-          sudo truncate -s 9G "$RUNNER_TEMP/collector-proof.img"
-          sudo mkfs.ext4 -q "$RUNNER_TEMP/collector-proof.img"
+          sudo truncate -s 12000000000 "$RUNNER_TEMP/collector-proof.img"
+          # Host reserves stay outside this private data volume.
+          sudo mkfs.ext4 -q -m 0 "$RUNNER_TEMP/collector-proof.img"
           sudo mkdir -p "$task_proof_root"
           sudo mount -o loop "$RUNNER_TEMP/collector-proof.img" "$task_proof_root"
           sudo cp scripts/collector-proof-2409.{sh,py} "$task_proof_root/"
@@ -51,6 +53,11 @@ jobs:
             'apt-get update -qq; apt-get install -y --no-install-recommends ca-certificates curl git python3 zstd libgomp1; rm -rf /var/lib/apt/lists/*'
           docker commit collector-proof-tools collector-proof-runtime:local
           docker rm collector-proof-tools
+          task_checkout_bytes=$(du -sb "$GITHUB_WORKSPACE" | cut -f1)
+          task_base_bytes=$(docker image inspect "$task_node_image" --format '{{.Size}}')
+          task_runtime_bytes=$(docker image inspect collector-proof-runtime:local --format '{{.Size}}')
+          # Double-count shared image layers conservatively; retain 512 MiB for logs/temp.
+          test "$((task_checkout_bytes + task_base_bytes + task_runtime_bytes + 536870912))" -le 2000000000
           timeout --signal=TERM --kill-after=15s 31m docker run --rm --name collector-proof-runtime \
             --init --read-only --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
             --cpus 3 --memory 10g --memory-swap 10g --pids-limit 512 \
