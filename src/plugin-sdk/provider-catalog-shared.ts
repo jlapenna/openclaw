@@ -160,6 +160,7 @@ export async function getCachedLiveCatalogValue<T>(params: {
   ) {
     return await consumeLiveCatalog(existing, params.signal);
   }
+  // SAFETY: Budget aliases point to the same typed entry as their caller-owned catalog key.
   const shared = liveCatalogCache.get(pendingKey) as LiveCatalogCacheEntry<T> | undefined;
   if (
     shared &&
