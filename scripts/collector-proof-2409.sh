@@ -30,17 +30,19 @@ curl -fsSL -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/downlo
 echo '2c718373086c9eda54d1e994cd5197aa079a4247e3dc4ec9edee8254cee08746  llama.tar.gz' | sha256sum -c -
 mkdir llama
 tar -xzf llama.tar.gz -C llama
+# 16K FP16 KV cache: 2,415,919,104 bytes (36 layers, 8 KV heads, dim128).
+# Weights + KV use <5 GB, leaving >5 GB of the same 10 GiB envelope.
 # Admit model bytes plus 512 MiB runtime growth before producing them.
 task_free_bytes=$(df --output=avail -B1 "$task_root" | tail -1 | tr -d ' ')
-test "$task_free_bytes" -ge "$((1834426016 + 536870912))"
-printf 'PROOF storage_available=%s model_bytes=1834426016 runtime_growth_reserve=536870912\n' "$task_free_bytes"
-curl -fsSL -o model.gguf https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf
-echo '061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a  model.gguf' | sha256sum -c -
+test "$task_free_bytes" -ge "$((2497280736 + 536870912))"
+printf 'PROOF storage_available=%s model_bytes=2497280736 runtime_growth_reserve=536870912\n' "$task_free_bytes"
+curl -fsSL -o model.gguf https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/ae44f08e1392f39c0e474af10c3ff8355c8b6688/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+echo '2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e  model.gguf' | sha256sum -c -
 task_server=$(find "$task_root/llama" -type f -name llama-server -print -quit)
 test -n "$task_server"
 export LD_LIBRARY_PATH="$(dirname "$task_server")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$task_server" -m "$task_root/model.gguf" --alias proof-cpu --host 127.0.0.1 \
-  --port 18801 --ctx-size 32768 --parallel 1 --n-gpu-layers 0 --threads 3 \
+  --port 18801 --ctx-size 16384 --parallel 1 --n-gpu-layers 0 --threads 3 \
   --threads-batch 3 --jinja --chat-template-kwargs '{"enable_thinking":false}' \
   > "$task_root/model.log" 2>&1 &
 task_model_pid=$!
@@ -66,7 +68,7 @@ for task_try in {1..90}; do
   sleep 2
 done
 curl -fsS http://127.0.0.1:18801/health > /dev/null
-printf 'PROOF model=Qwen3-1.7B-Q8_0 revision=90862c4b9d2787eaed51d12237eafdfe7c5f6077 server=b11803 ready=true\n'
+printf 'PROOF model=Qwen3-4B-Instruct-2507-Q4_K_M revision=ae44f08e1392f39c0e474af10c3ff8355c8b6688 server=b11803 ready=true\n'
 cd "$task_root/source"
 # Use the supported offline writer for a shared, dummy local inference account.
 # Cron requires durable account ownership even for an unauthenticated local model.

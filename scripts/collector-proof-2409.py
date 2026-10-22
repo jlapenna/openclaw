@@ -37,7 +37,7 @@ def configure():
             "No external actions. No exec, browsing, or messages.\n"
         )
     model = {"id": "proof-cpu", "name": "Public CPU proof model", "reasoning": False,
-             "input": ["text"], "contextWindow": 32768, "maxTokens": 2048,
+             "input": ["text"], "contextWindow": 16384, "maxTokens": 2048,
              "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}}
     config = {
         "gateway": {"mode": "local", "bind": "loopback", "port": 18791,
@@ -59,15 +59,21 @@ def configure():
 
 def run():
     task = (
-        "Do this bounded verification exactly, using tools. "
-        "1. Spawn exactly one collector: sessions_spawn with agentId='collector', mode='run', "
-        "collect=true, task='Reply with exactly COLLECTOR_CHILD_2409_OK and nothing else'. "
-        "Do not set completionTarget. "
-        "2. Call agents_wait with ids=[the returned runId] and timeoutSeconds=180. "
-        "If pending remains, wait again. Do not spawn another child. "
-        "3. Only after agents_wait returns that child with status done and result containing "
-        "COLLECTOR_CHILD_2409_OK, use write to create proof-marker.txt with content " + MARKER + ". "
-        "4. Finish with exactly NO_REPLY. No explanations. No other tools or actions."
+        "Execute this exact sequence using dispatch_action. The action IDs below are already known; "
+        "do not search for or describe sessions_spawn. "
+        "STEP A, ONCE ONLY: dispatch_action id='openclaw:core:sessions_spawn', "
+        "args={agentId:'collector',mode:'run',collect:true,"
+        "task:'Reply with exactly COLLECTOR_CHILD_2409_OK and nothing else'}. "
+        "Do not set completionTarget. When status is accepted, spawning is FINISHED. "
+        "Never call sessions_spawn again. Save the returned runId and move to STEP B. "
+        "STEP B: dispatch_action id='openclaw:core:agents_wait', "
+        "args={ids:[the actual runId from STEP A],timeoutSeconds:180}. "
+        "If pending remains, repeat only STEP B with the SAME runId. "
+        "STEP C: after completed contains that run with status done and result containing "
+        "COLLECTOR_CHILD_2409_OK, dispatch_action id='openclaw:core:write', "
+        "args={path:'proof-marker.txt',content:'" + MARKER + "'}. "
+        "STEP D: finish with exactly NO_REPLY. No explanations. "
+        "Only one collector is permitted. Do not repeat completed steps."
     )
     added = cli("cron", "add", "--name", "temporary-collector-proof-2409",
                 "--agent", "parent", "--session", "isolated", "--at", "1h",
