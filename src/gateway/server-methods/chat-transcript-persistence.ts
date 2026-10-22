@@ -51,7 +51,10 @@ type AssistantTranscriptScopeParams = {
   agentId?: string;
 };
 
-type ResolvedAssistantTranscriptScope = SessionTranscriptWriteScope & { sessionId: string };
+export type ResolvedAssistantTranscriptScope = SessionTranscriptWriteScope & {
+  sessionId: string;
+  sessionKey: string;
+};
 
 type SourceReplyTranscriptMirrorMetadata = NonNullable<
   ReturnType<typeof getReplyPayloadMetadata>
@@ -103,7 +106,7 @@ function mergeAssistantDisplayContent(
   return content;
 }
 
-function buildAssistantDisplayRewrite(params: {
+export function buildAssistantDisplayRewrite(params: {
   message: Record<string, unknown>;
   displayContent: AssistantDisplayContentBlock[];
   mediaBySource?: AssistantDisplayMediaBySource;
@@ -335,23 +338,25 @@ function mediaReferenceSet(mediaUrls: readonly string[]) {
   );
 }
 
-function findAssistantTranscriptMessageByIdAndMediaInEvents(
+function findAssistantTranscriptMessageByTurnIndexAndMediaInEvents(
   events: readonly TranscriptEvent[],
   params: {
-    messageId: string;
+    assistantMessageIndex: number;
     mediaUrls: readonly string[];
     rejectedMediaCount: number;
   },
 ): { messageId: string; message: Record<string, unknown> } | null {
   const expectedMedia = mediaReferenceSet(params.mediaUrls);
-  if ((expectedMedia.size === 0 && params.rejectedMediaCount === 0) || !params.messageId.trim()) {
+  if (
+    (expectedMedia.size === 0 && params.rejectedMediaCount === 0) ||
+    !Number.isSafeInteger(params.assistantMessageIndex) ||
+    params.assistantMessageIndex < 1
+  ) {
     return null;
   }
-  const target = events.find(
-    (event) =>
-      transcriptEventId(event) === params.messageId &&
-      transcriptEventMessage(event)?.role === "assistant",
-  );
+  const target = events.filter((event) => transcriptEventMessage(event)?.role === "assistant")[
+    params.assistantMessageIndex - 1
+  ];
   const found = transcriptMessageTarget(target);
   const text = found ? extractAssistantPhaseText(found.message) : undefined;
   if (!found || !text) {
@@ -627,9 +632,9 @@ export async function rewriteAssistantTranscriptMessageByIdempotencyKey(params: 
   });
 }
 
-export async function rewriteAssistantTranscriptMessageByIdAndMedia(params: {
+export async function rewriteAssistantTranscriptMessageByTurnIndexAndMedia(params: {
   afterSeq: number;
-  messageId: string;
+  assistantMessageIndex: number;
   content: AssistantDisplayContentBlock[];
   mediaBySource?: AssistantDisplayMediaBySource;
   expectedGeneration: string | null;
@@ -654,22 +659,18 @@ export async function rewriteAssistantTranscriptMessageByIdAndMedia(params: {
       // The pre-dispatch SQLite sequence is the exact turn boundary; timestamps can collide.
       // Exact-row rewrites preserve that sequence while rotating the generation returned to callers.
       const events = await transcript.readEvents();
-      const target = findAssistantTranscriptMessageByIdAndMediaInEvents(events, params);
+      const target = findAssistantTranscriptMessageByTurnIndexAndMediaInEvents(events, params);
       if (!target) {
         return null;
       }
-      const rewrittenMessage = {
-        ...buildAssistantDisplayRewrite({
-          message: target.message,
-          // The committed source owns visible text too. A streamed tail or a
-          // superseded media-only payload must not duplicate it in the display.
-          displayContent: params.content.filter((block) => block.type !== "text"),
-          mediaBySource: params.mediaBySource,
-          managedMediaUrls: params.mediaUrls,
-          retainOriginalText: true,
-        }),
-        content: target.message.content,
-      };
+      const rewrittenMessage = buildAssistantDisplayRewrite({
+        message: target.message,
+        displayContent: params.content,
+        mediaBySource: params.mediaBySource,
+        managedMediaUrls: params.mediaUrls,
+        // Indexed replies can contain earlier chunks; exact final/mirror replacements cannot.
+        retainOriginalText: true,
+      });
       await transcript.replaceEvents(
         events.map((event) =>
           transcriptEventId(event) === target.messageId

@@ -276,8 +276,6 @@ export function subscribeEmbeddedAgentSession(input: SubscribeEmbeddedAgentSessi
     state.inputAnswer = undefined;
     state.keptAnswer = undefined;
     state.lastAssistant = undefined;
-    state.assistantTranscriptSource = undefined;
-    state.lastAssistantTranscriptSource = undefined;
     state.lastAssistantTextMessageIndex = -1;
     state.lastAssistantTextContentIndex = undefined;
     state.lastAssistantTextItemId = undefined;
@@ -379,10 +377,7 @@ export function subscribeEmbeddedAgentSession(input: SubscribeEmbeddedAgentSessi
     captureModelEvent,
     incrementCompactionCount,
     noteCompactionTokensAfter,
-    getUsageTotals,
-    getLastAssistantUsage,
     getCompactionCount: () => compactionCount,
-    getLastCompactionTokensAfter: () => state.lastCompactionTokensAfter,
   };
 
   const removeSourceReplyTerminalHook = installToolAuthoredSourceReplyTerminalHook({
@@ -432,10 +427,6 @@ export function subscribeEmbeddedAgentSession(input: SubscribeEmbeddedAgentSessi
     answerSegments: state.answerSegments,
     getCurrentAttemptAssistant,
     getKeptAnswer: () => state.keptAnswer,
-    getLastAssistantTranscriptSource: () =>
-      state.keptAnswer
-        ? state.keptAnswer.assistantTranscriptSource
-        : state.lastAssistantTranscriptSource,
     hasSuccessfulModelResponse,
     getLastAssistantTextMessageIndex: () =>
       state.lastAssistantTextMessageIndex >= 0 ? state.lastAssistantTextMessageIndex : undefined,
@@ -487,8 +478,6 @@ export function subscribeEmbeddedAgentSession(input: SubscribeEmbeddedAgentSessi
     getSourceReplyDelivered: () => state.sourceReplyDelivered,
     getSourceReplyDeliveryState: () => state.sourceReplyDeliveryState,
     endsWithSourceProgress: () => state.lastToolTurnOnlySourceProgress === true,
-    getHeartbeatToolResponse: () =>
-      state.heartbeatToolResponse ? { ...state.heartbeatToolResponse } : undefined,
     getPendingToolMediaReply: () => readPendingToolMediaReply(state),
     getToolAutoDeliveryMediaUrls: () => [...state.toolAutoDeliveryMediaUrls],
     hasToolMediaBlockReply: () => state.hasToolMediaBlockReply,

@@ -17,15 +17,23 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import { patchSessionEntryCore } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import { replaceTranscriptEventsSync } from "../../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
+import type { SessionLifecycleRevisionExpectation } from "../../config/sessions/session-transcript-turn-lifecycle.types.js";
 import { historyLane } from "../../config/sessions/session-transcript-worker-resources.js";
-import { withSessionTranscriptWriteAssertion } from "../../config/sessions/transcript-write-context.js";
+import {
+  SessionTranscriptWriterClaimReboundError,
+  withSessionTranscriptWriteAssertion,
+} from "../../config/sessions/transcript-write-context.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
-import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../test-utils/openclaw-test-state.js";
 import { createGatewayMetadataCloseFixture } from "../server-close.metadata.test-support.js";
 import {
+  enrichAssistantTranscriptMediaForRun,
   rewriteAssistantTranscriptMessageByIdempotencyKey as rewriteByKey,
-  rewriteAssistantTranscriptMessageByIdAndMedia as rewriteById,
+  rewriteAssistantTranscriptMessageByTurnIndexAndMedia as rewriteByTurn,
   rewriteSourceReplyTranscriptMirrors as rewriteMirrors,
 } from "./chat-transcript-persistence.js";
 
@@ -81,12 +89,12 @@ async function seed(env: NodeJS.ProcessEnv) {
   const keyed = (replacement = content) =>
     rewriteByKey({ scope, content: replacement, idempotencyKey: " delivery-key " });
   const source = () => rewriteMirrors({ scope, candidates: [mirror], requests: [request] });
-  const indexed = (overrides: Partial<Parameters<typeof rewriteById>[0]> = {}) =>
-    rewriteById({
+  const indexed = (overrides: Partial<Parameters<typeof rewriteByTurn>[0]> = {}) =>
+    rewriteByTurn({
       scope,
       content,
       afterSeq: 0,
-      messageId: "selected",
+      assistantMessageIndex: 2,
       expectedGeneration: initialGeneration,
       mediaUrls: [mediaUrl],
       rejectedMediaCount: 0,
@@ -118,39 +126,16 @@ const replaceSelected = (events: Events) =>
 // Run the interleaving once, at the first content read during preparation.
 function contentOnRead(text: string, action: () => void) {
   let prepared = false;
-  const prepare = vi.fn(action);
   return {
-    prepare,
     content: [
       {
         type: "text",
         get text() {
           if (!prepared) {
             prepared = true;
-            prepare();
+            action();
           }
           return text;
-        },
-      },
-    ],
-  };
-}
-
-// Receipted rewrites keep committed text, so interleave on a display media read.
-function mediaOnRead(alt: string, action: () => void) {
-  let prepared = false;
-  const prepare = vi.fn(action);
-  return {
-    prepare,
-    content: [
-      {
-        type: "image",
-        get alt() {
-          if (!prepared) {
-            prepared = true;
-            prepare();
-          }
-          return alt;
         },
       },
     ],
@@ -194,18 +179,7 @@ describe("durable transcript mirror corrections", () => {
       const after = fixture.snapshot();
       expect(unselected(after)).toEqual(unselected(before));
       expect(after).toHaveLength(before.length);
-      expect(selected(after)).toMatchObject({
-        message:
-          kind === "indexed"
-            ? {
-                idempotencyKey: "delivery-key",
-                // The committed row owns visible text; a correction supplies display media only.
-                openclawDisplayContent: expect.arrayContaining([
-                  { type: "text", text: "Original delivery." },
-                ]),
-              }
-            : correctedMessage,
-      });
+      expect(selected(after)).toMatchObject({ message: correctedMessage });
       if (kind === "keyed") {
         await expect(fixture.keyed()).resolves.toEqual({ messageId: "selected" });
         expect(fixture.snapshot()).toEqual(after);
@@ -230,7 +204,7 @@ describe("durable transcript mirror corrections", () => {
       for (const overrides of [
         { mediaUrls: ["https://example.com/another.png"] },
         { rejectedMediaCount: 1 },
-        { messageId: "missing" },
+        { assistantMessageIndex: 3 },
         { expectedGeneration: "stale-generation" },
       ]) {
         await expect(indexed(overrides)).resolves.toBeNull();
@@ -243,11 +217,10 @@ describe("durable transcript mirror corrections", () => {
     "reports refusal when indexed correction loses its source generation",
     withFixture(async ({ scope, snapshot, indexed }) => {
       const retained = replaceSelected(snapshot());
-      const replacement = mediaOnRead("Stale correction.", () => {
+      const replacement = contentOnRead("Stale correction.", () => {
         expect(replaceTranscriptEventsSync(scope, retained)).toBe(true);
       });
       const result = await indexed({ content: replacement.content });
-      expect(replacement.prepare).toHaveBeenCalledOnce();
       expect(result).toBeNull();
       expect(snapshot()).toEqual(retained);
     }),
@@ -257,12 +230,11 @@ describe("durable transcript mirror corrections", () => {
     "retains an unrelated append during indexed correction",
     withFixture(async ({ append, snapshot, indexed }) => {
       let retained = snapshot();
-      const replacement = mediaOnRead(correctedText, () => {
+      const replacement = contentOnRead(correctedText, () => {
         append("later", { role: "user", content: "Following turn." });
         retained = snapshot();
       });
       const result = await indexed({ content: replacement.content });
-      expect(replacement.prepare).toHaveBeenCalledOnce();
       expect(result).toMatchObject({ messageId: "selected", generation: expect.any(String) });
       const after = snapshot();
       expect(unselected(after)).toEqual(unselected(retained));
@@ -270,63 +242,7 @@ describe("durable transcript mirror corrections", () => {
       expect(after.find((event) => isRecord(event) && event.id === "later")).toMatchObject({
         message: { role: "user", content: "Following turn." },
       });
-      expect(selected(after)).toMatchObject({
-        message: {
-          idempotencyKey: "delivery-key",
-          openclawDisplayContent: expect.arrayContaining([{ type: "image", alt: correctedText }]),
-        },
-      });
-    }),
-  );
-
-  it(
-    "preserves distinct signed completions while enriching exactly the receipted row",
-    withFixture(async ({ append, snapshot, indexed }) => {
-      for (const messageId of ["first-response", "later-response"]) {
-        append(messageId, {
-          role: "assistant",
-          responseId: messageId,
-          content: [
-            {
-              type: "text",
-              text: `Identical answer.\nMEDIA:${mediaUrl}`,
-              textSignature: JSON.stringify({ v: 1, id: messageId, phase: "final_answer" }),
-            },
-          ],
-        });
-      }
-      const before = snapshot();
-      await expect(
-        indexed({
-          messageId: "later-response",
-          content: [
-            { type: "text", text: "answer tail" },
-            { type: "image", url: "/managed/image" },
-          ],
-        }),
-      ).resolves.toMatchObject({ messageId: "later-response" });
-      const after = snapshot();
-      expect(after).toHaveLength(before.length);
-      for (const [index, original] of before.entries()) {
-        const updated = after[index];
-        if (!isRecord(original) || original.id !== "later-response") {
-          expect(updated).toEqual(original);
-          continue;
-        }
-        if (!isRecord(original.message)) {
-          throw new Error("Expected canonical assistant fixture message");
-        }
-        expect(updated).toMatchObject({
-          message: {
-            responseId: "later-response",
-            content: original.message.content,
-            openclawDisplayContent: [
-              { type: "text", text: "Identical answer." },
-              { type: "image", url: "/managed/image" },
-            ],
-          },
-        });
-      }
+      expect(selected(after)).toMatchObject({ message: correctedMessage });
     }),
   );
 
@@ -354,7 +270,6 @@ describe("durable transcript mirror corrections", () => {
           ? "SQLite transcript changed while preparing rewrite"
           : "Delivery authority revoked",
       );
-      expect(replacement.prepare).toHaveBeenCalledOnce();
       expect(snapshot()).toEqual(retained);
     }),
   );
@@ -440,4 +355,222 @@ it("settles an accepted correction across the Gateway close prelude before closi
     await Promise.allSettled([held, correcting, closing]);
     await fixture.cleanup();
   }
+});
+
+const RUN_ID = "generated-media-completion";
+const MESSAGE_ID = "completion-answer";
+const caption = "Here are four options.";
+const choice = "Pick 1, 2, 3, or 4.";
+const warningText = "Synthetic attachment warning.";
+const text = (value: string, textSignature?: string) => ({
+  type: "text",
+  text: value,
+  ...(textSignature ? { textSignature } : {}),
+});
+type Content = Record<string, unknown>[];
+const transcriptEvent = (eventId: string, role: string, blocks: Content, extra = {}) => ({
+  eventId,
+  message: { role, content: blocks, ...extra },
+});
+const assistant = (eventId: string, blocks: Content, runId = RUN_ID, extra = {}) =>
+  transcriptEvent(eventId, "assistant", blocks, {
+    stopReason: "stop",
+    __openclaw: { runId },
+    ...extra,
+  });
+function displayOrder(display: unknown[]) {
+  return display.map((block) =>
+    isRecord(block) && block.type === "text" && typeof block.text === "string"
+      ? block.text.trim()
+      : isRecord(block)
+        ? block.type
+        : undefined,
+  );
+}
+
+async function withTranscriptFixture(
+  lifecycleRevision: SessionLifecycleRevisionExpectation,
+  run: (fixture: Awaited<ReturnType<typeof seedTranscript>>) => Promise<void>,
+  singleText = false,
+): Promise<void> {
+  await withOpenClawTestState({ label: "generated-media-transcript" }, async (state) => {
+    await run(await seedTranscript(state, lifecycleRevision, singleText));
+  });
+}
+
+async function seedTranscript(
+  state: OpenClawTestState,
+  lifecycleRevision: SessionLifecycleRevisionExpectation,
+  singleText: boolean,
+) {
+  setRuntimeConfigSnapshot({});
+  const scope = {
+    agentId: "main",
+    sessionId: "media-session",
+    sessionKey: "agent:main:generated-media",
+    env: state.env,
+  };
+  await replaceSessionEntry(scope, {
+    sessionId: scope.sessionId,
+    updatedAt: 1,
+    ...(lifecycleRevision === null ? {} : { lifecycleRevision }),
+  });
+  const generatedMediaUrl = state.statePath("media", "generated-sheet.png");
+  const mediaBlock = {
+    type: "image",
+    artifactId: "artifact_managed_image_generated-sheet",
+    url: "/api/chat/media/outgoing/agent%3Amain%3Agenerated-media/generated-sheet/full",
+    alt: "generated-sheet.png",
+    mimeType: "image/png",
+  };
+  const warning = text(warningText);
+  const mediaGroup = singleText ? [mediaBlock, warning] : [mediaBlock];
+  const messages = [
+    assistant("older-answer", [text("An earlier answer.")], "older-run"),
+    transcriptEvent("request", "user", [text("Make an avatar sheet.")]),
+    assistant(
+      "generation-tool-call",
+      [
+        text("Preparing the sheet.", "signed-progress"),
+        { type: "toolCall", id: "generate-call", name: "image_generate", arguments: {} },
+      ],
+      RUN_ID,
+      { stopReason: "toolUse" },
+    ),
+    transcriptEvent("generation-tool-result", "toolResult", [text("Generated one image.")], {
+      toolCallId: "generate-call",
+      toolName: "image_generate",
+      __openclaw: { runId: RUN_ID },
+    }),
+    assistant(
+      MESSAGE_ID,
+      singleText
+        ? [
+            text(
+              `[[reply_to_current]]\n${caption}\nMEDIA:${generatedMediaUrl}\nMEDIA:${generatedMediaUrl}\n${choice}`,
+              JSON.stringify({ v: 1, id: "answer", phase: "final_answer" }),
+            ),
+          ]
+        : [
+            { type: "thinking", thinking: "Synthetic reasoning.", thinkingSignature: "opaque" },
+            text(`${caption}\n`, "signed-caption"),
+            text(`MEDIA:${generatedMediaUrl}`, "signed-media"),
+            text(`\n${choice}`, "signed-choice"),
+          ],
+      RUN_ID,
+      { openclawDelivery: { replyToCurrent: true } },
+    ),
+    transcriptEvent("later-request", "user", [text("Show that sheet again.")]),
+    assistant(
+      "later-answer",
+      [text(`The same sheet, in a later turn.\nMEDIA:${generatedMediaUrl}`)],
+      "later-run",
+    ),
+  ];
+  for (const [index, { eventId, message }] of messages.entries()) {
+    const result = appendTranscriptMessageSync(scope, { eventId, message, now: 1_000 + index });
+    expect(result).toMatchObject({ ok: true, value: { appended: true, messageId: eventId } });
+  }
+  const snapshot = () => {
+    const database = openOpenClawAgentDatabase(scope);
+    const rows = database.db
+      .prepare("SELECT seq, event_json FROM transcript_events WHERE session_id = ? ORDER BY seq")
+      .all(scope.sessionId)
+      .map((row) => {
+        assert(typeof row.seq === "number" && typeof row.event_json === "string");
+        const event: unknown = JSON.parse(row.event_json);
+        assert(isRecord(event));
+        return { seq: row.seq, eventJson: row.event_json, event };
+      });
+    return { rows, watermark: readSessionTranscriptWatermark(scope) };
+  };
+  return {
+    scope,
+    snapshot,
+    mediaBlock,
+    enrich: (runId = RUN_ID) =>
+      enrichAssistantTranscriptMediaForRun({
+        scope,
+        runId,
+        expectedLifecycleRevision: lifecycleRevision,
+        content: [text([caption, choice].join(singleText ? "\n" : "\n\n\n")), ...mediaGroup],
+        mediaBySource: new Map([[generatedMediaUrl, mediaGroup]]),
+        mediaUrls: [generatedMediaUrl],
+      }),
+  };
+}
+
+describe("generated-media transcript enrichment", () => {
+  it.each([
+    [null, false],
+    ["initial-revision", false],
+    ["initial-revision", true],
+  ] as const)(
+    "preserves signed captions, media order, warnings, and replay (revision=%s, singleText=%s)",
+    async (revision, singleText) => {
+      await withTranscriptFixture(
+        revision,
+        async ({ enrich, snapshot, mediaBlock }) => {
+          const before = snapshot();
+          await expect(enrich()).resolves.toEqual({ messageId: MESSAGE_ID });
+          const after = snapshot();
+          expect(after.rows).toHaveLength(before.rows.length);
+          expect(after.watermark.maxSeq).toBe(before.watermark.maxSeq);
+          expect(after.watermark.generation).not.toBe(before.watermark.generation);
+          for (const [index, row] of before.rows.entries()) {
+            const rewritten = after.rows[index];
+            if (row.event.id !== MESSAGE_ID) {
+              expect(rewritten).toEqual(row);
+              continue;
+            }
+            assert(rewritten && isRecord(row.event.message) && isRecord(rewritten.event.message));
+            const { message: _originalMessage, ...originalEnvelope } = row.event;
+            const { message: _rewrittenMessage, ...rewrittenEnvelope } = rewritten.event;
+            expect(rewritten.seq).toBe(row.seq);
+            expect(rewrittenEnvelope).toEqual(originalEnvelope);
+            expect(rewritten.event.message.content).toEqual(row.event.message.content);
+            expect(rewritten.event.message.openclawDelivery).toMatchObject({
+              replyToCurrent: true,
+            });
+            const display = rewritten.event.message.openclawDisplayContent;
+            assert(Array.isArray(display));
+            expect(display.filter((block) => isRecord(block) && block.type === "image")).toEqual([
+              mediaBlock,
+            ]);
+            expect(
+              displayOrder(display.filter((block) => isRecord(block) && block.type !== "thinking")),
+            ).toEqual([caption, "image", ...(singleText ? [warningText] : []), choice]);
+          }
+
+          await expect(enrich()).resolves.toEqual({ messageId: MESSAGE_ID });
+          expect(snapshot()).toEqual(after);
+        },
+        singleText,
+      );
+    },
+  );
+
+  it("leaves the transcript unchanged when the requested run has no assistant reply", async () => {
+    await withTranscriptFixture("initial-revision", async ({ enrich, snapshot }) => {
+      const before = snapshot();
+      await expect(enrich("missing-run")).resolves.toBeNull();
+      expect(snapshot()).toEqual(before);
+    });
+  });
+
+  it.each([
+    ["session replacement", "initial-revision", "replacement-session", "initial-revision"],
+    ["same-session revision change", "initial-revision", "media-session", "replacement-revision"],
+    ["previously absent revision", null, "media-session", "replacement-revision"],
+  ] as const)(
+    "rejects stale media after %s",
+    async (_label, captured, sessionId, lifecycleRevision) => {
+      await withTranscriptFixture(captured, async ({ scope, enrich, snapshot }) => {
+        await replaceSessionEntry(scope, { sessionId, lifecycleRevision, updatedAt: 2 });
+        const before = snapshot();
+        await expect(enrich()).rejects.toBeInstanceOf(SessionTranscriptWriterClaimReboundError);
+        expect(snapshot()).toEqual(before);
+      });
+    },
+  );
 });

@@ -1,9 +1,9 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it } from "vitest";
-import type { CronJob } from "../api/types.ts";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
 import { cronListResponseFixture } from "../test-helpers/cron.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import { cronJob, cronList } from "./cron-fixtures.test-support.ts";
 
 // Exercise shipped CSS chunks: a cold source-mode route omits cross-page selectors.
 const suite = createControlUiE2eSuite({
@@ -14,27 +14,19 @@ const suite = createControlUiE2eSuite({
 suite.define(() => {
   it("keeps query loading local before replacing an expanded inventory", async () => {
     await suite.withPage({ viewport: { width: 1280, height: 900 } }, async ({ page, context }) => {
-      const jobs: CronJob[] = Array.from({ length: 100 }, (_, index) => ({
-        id: "inventory-" + index,
-        name: "Inventory reminder " + index,
-        enabled: true,
-        createdAtMs: 0,
-        updatedAtMs: 0,
-        schedule: { kind: "every", everyMs: 3_600_000 },
-        sessionTarget: "main",
-        wakeMode: "next-heartbeat",
-        payload: { kind: "systemEvent", text: "Synthetic inventory reminder" },
-        state: {},
-      }));
-      const inventoryPage = (offset: number) => ({
-        jobs: jobs.slice(offset, offset + 50),
-        snapshotRevision: "inventory-query",
-        total: jobs.length,
-        offset,
-        limit: 50,
-        hasMore: offset === 0,
-        nextOffset: offset === 0 ? 50 : null,
-      });
+      const jobs = Array.from({ length: 100 }, (_, index) =>
+        cronJob("inventory-" + index, "Inventory reminder " + index, {
+          schedule: { kind: "every", everyMs: 3_600_000 },
+          payload: { kind: "systemEvent", text: "Synthetic inventory reminder" },
+        }),
+      );
+      const inventoryPage = (offset: number) =>
+        cronList(jobs.slice(offset, offset + 50), "inventory-query", {
+          total: jobs.length,
+          offset,
+          hasMore: offset === 0,
+          nextOffset: offset === 0 ? 50 : null,
+        });
       const gateway = await installMockGateway(page, {
         methodResponses: {
           "cron.list": cronListResponseFixture([
@@ -106,8 +98,38 @@ suite.define(() => {
       // Count work rather than wall time so the regression is independent of CPU speed.
       expect(recalculated.length).toBeGreaterThan(0);
       expect(Math.max(...recalculated)).toBeLessThan(jobs.length);
-      await gateway.resolveDeferred("cron.list");
-      await expect.poll(() => rows.count()).toBe(50);
+      const resultClient = await context.newCDPSession(page);
+      try {
+        await resultClient.send("Performance.enable");
+        const before: { metrics: Array<{ name: string; value: number }> } =
+          await resultClient.send("Performance.getMetrics");
+        const started = performance.now();
+        await gateway.resolveDeferred("cron.list");
+        await expect.poll(() => rows.count()).toBe(50);
+        const elapsedMs = performance.now() - started;
+        const after: typeof before = await resultClient.send("Performance.getMetrics");
+        console.log(
+          JSON.stringify({
+            proof: "cron-expanded-inventory-search-results",
+            jobs: jobs.length,
+            elapsedMs,
+            metrics: Object.fromEntries(
+              ["ScriptDuration", "TaskDuration", "LayoutDuration", "RecalcStyleDuration"].map(
+                (name) => {
+                  const earlier = before.metrics.find((entry) => entry.name === name)?.value;
+                  const later = after.metrics.find((entry) => entry.name === name)?.value;
+                  if (earlier === undefined || later === undefined) {
+                    throw new Error(`Missing CDP metric: ${name}`);
+                  }
+                  return [name, (later - earlier) * 1000];
+                },
+              ),
+            ),
+          }),
+        );
+      } finally {
+        await resultClient.detach();
+      }
       expect(await search.inputValue()).toBe("i");
       expect(await search.evaluate((element) => element === document.activeElement)).toBe(true);
       await expect.poll(() => loadMore.isEnabled()).toBe(true);

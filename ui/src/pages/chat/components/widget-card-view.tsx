@@ -1,17 +1,21 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
-  createEffect,
   createMemo,
   createSignal,
-  onCleanup,
+  Errored,
+  lazy,
+  Loading,
   onSettled,
   Show,
   untrack,
   useContext,
 } from "solid-js";
 import { ensureCustomElementDefined } from "../../../app/lazy-custom-element.ts";
+import type { OpenClawCanvasWidgetView } from "../../../components/canvas-widget-view.tsx";
 import { dispatchWidgetPrompt } from "../../../components/mcp-app-security.ts";
 import { Icon } from "../../../components/solid/icon.tsx";
+import { LazyViewError } from "../../../components/solid/lazy-view-error.tsx";
+import { registerChatSessionEnglish } from "../../../i18n/locales/en-chat-session.ts";
 import { registerMcpAppEnglish } from "../../../i18n/locales/en-mcp-app.ts";
 import {
   canvasWidgetNameForDocument,
@@ -32,21 +36,29 @@ import {
 } from "../../../lib/chat/tool-display.ts";
 import { parseYouTubeVideoUrl } from "../../../lib/chat/youtube-video.ts";
 import { cancelLayout, scheduleLayout } from "../../../lib/layout-frame.ts";
-import { t } from "../../../lib/reactive/i18n.ts";
+import { registerEnglishCatalog, t } from "../../../lib/reactive/i18n.ts";
 import { listen } from "../../../lib/reactive/listener.ts";
+import { createResizeObserver } from "../../../lib/reactive/observers.ts";
 import { ContentPresentation } from "../../../lib/solid/presentation.ts";
 import { showToast } from "../../../lib/toast.ts";
 import { postWidgetTheme, registerWidgetThemeFrame } from "../../../lib/widget-theme.ts";
+import { BrowserTabCardHost } from "./browser-tab-card.tsx";
 import { CanvasWidgetMount } from "./canvas-widget-mount.tsx";
-import "./browser-tab-card.tsx";
 import {
   WidgetCardMenu,
   type WidgetAction,
   type WidgetRawDetailsLabel,
 } from "./widget-card-menu.tsx";
 import { exportWidget } from "./widget-export.ts";
+import { WidgetPinButton, type WidgetPinTarget } from "./widget-pin-button.tsx";
+
+registerEnglishCatalog(registerChatSessionEnglish);
 
 registerMcpAppEnglish();
+
+const YouTubeVideoCard = lazy(() => import("./youtube-video-card.tsx"), {
+  export: "YouTubeVideoCard",
+});
 
 type WidgetCardOptions = {
   rawText?: string | null;
@@ -58,47 +70,9 @@ type WidgetCardOptions = {
   messageTimestamp?: number;
   boardProvider?: BoardProvider;
   widgetLayout?: import("../session-message-cache.ts").ChatWidgetLayout;
-  browserTabRevision?: string;
-  browserTabLatest?: boolean;
 };
 
-async function pinWidget(
-  event: Event,
-  preview: CanvasToolPreview,
-  provider: BoardProvider,
-  name: string,
-  mcpAppViewId?: string,
-): Promise<void> {
-  const viewId = mcpAppViewId || preview.viewId?.trim();
-  if (!viewId) {
-    return;
-  }
-  const button = event.currentTarget;
-  if (!(button instanceof HTMLButtonElement)) {
-    return;
-  }
-  button.disabled = true;
-  const pendingLabel = t("chat.toolCards.pinToDashboardPending");
-  button.title = button.ariaLabel = pendingLabel;
-  try {
-    const identity = {
-      name,
-      ...(preview.title?.trim() ? { title: preview.title.trim() } : {}),
-    };
-    await (mcpAppViewId
-      ? provider.pinMcpApp({ ...identity, viewId })
-      : provider.pinWidget({ ...identity, docId: viewId }));
-    const pinnedLabel = t("chat.toolCards.pinnedToDashboard");
-    button.title = button.ariaLabel = pinnedLabel;
-    button.dataset.pinned = "true";
-  } catch {
-    button.disabled = false;
-    button.ariaLabel = t("chat.toolCards.pinToDashboard");
-    const failureLabel = t("chat.toolCards.pinToDashboardFailed");
-    button.title = failureLabel;
-    showToast({ message: failureLabel });
-  }
-}
+type WidgetExportSource = HTMLIFrameElement | OpenClawCanvasWidgetView | undefined;
 
 function isManagedCanvasDocumentPreview(preview: CanvasToolPreview): boolean {
   const viewId = preview.viewId?.trim();
@@ -282,7 +256,7 @@ type PreviewFrameParams = {
 function WidgetFrame(props: {
   params: PreviewFrameParams;
   promptAllowed: () => boolean;
-  onFrame: (frame: HTMLIFrameElement) => void;
+  onFrame: (frame: HTMLIFrameElement | undefined) => void;
 }) {
   let frame: HTMLIFrameElement | undefined;
   const [reportedHeight, setReportedHeight] = createSignal<number>();
@@ -306,19 +280,21 @@ function WidgetFrame(props: {
         setReportedHeight(nextHeight);
         props.params.onHeightChange?.(nextHeight);
       });
-      return registerWidgetThemeFrame(element, "*");
-    });
-    onCleanup(() => {
-      widgetFrameRegistry.delete(element);
-      widgetFrameResize.delete(element);
-      widgetFramePromptActive.delete(element);
+      const releaseTheme = registerWidgetThemeFrame(element, "*");
+      props.onFrame(element);
+      return () => {
+        props.onFrame(undefined);
+        releaseTheme();
+        widgetFrameRegistry.delete(element);
+        widgetFrameResize.delete(element);
+        widgetFramePromptActive.delete(element);
+      };
     });
     return (
       <iframe
         ref={(next) => {
           element = next;
           frame = next;
-          props.onFrame(next);
         }}
         src={src() || undefined}
         class="chat-tool-card__preview-frame"
@@ -350,7 +326,10 @@ function WidgetFrame(props: {
   );
 }
 
-function PreviewFrame(props: { params: PreviewFrameParams }) {
+function PreviewFrame(props: {
+  params: PreviewFrameParams;
+  onExportSource: (source: WidgetExportSource) => void;
+}) {
   let frame: HTMLIFrameElement | undefined;
   const presentation = createCanvasFramePresentation(
     () =>
@@ -371,6 +350,7 @@ function PreviewFrame(props: { params: PreviewFrameParams }) {
           promptAllowed={presentation.active}
           onFrame={(next) => {
             frame = next;
+            props.onExportSource(next);
           }}
         />
       )}
@@ -378,29 +358,47 @@ function PreviewFrame(props: { params: PreviewFrameParams }) {
   );
 }
 
-const loadMcpAppView = async () => {
-  await import("../../../components/mcp-app-view-registration.ts");
-};
+const loadMcpAppView = () => import("../../../components/mcp-app-view-registration.ts");
 
 const loadCanvasWidgetView = () => import("../../../components/canvas-widget-view.tsx");
-const loadYouTubeVideo = () => import("./youtube-video-card.tsx");
+
+function WidgetRegistration(props: { tagName: string; loadModule: () => Promise<unknown> }) {
+  const ready = createMemo(() =>
+    ensureCustomElementDefined(props.tagName, props.loadModule).then(() => null),
+  );
+  return (
+    <Errored
+      fallback={(error, reset) => (
+        <LazyViewError
+          error={error()}
+          onRetry={() => reset()}
+          actionLabel={t("common.retry")}
+          inline
+        />
+      )}
+    >
+      <Loading>{ready()}</Loading>
+    </Errored>
+  );
+}
 
 function WidgetContent(props: {
   preview: CanvasToolPreview;
   sandbox: string;
   options?: WidgetCardOptions;
+  onExportSource: (source: WidgetExportSource) => void;
 }) {
-  const mcp = () => props.preview.mcpApp;
   const managed = () =>
     props.preview.sandbox !== "strict" && isManagedCanvasDocumentPreview(props.preview);
   return (
     <Show
-      when={mcp()}
+      when={props.preview.mcpApp}
       fallback={
         <Show
           when={managed()}
           fallback={
             <PreviewFrame
+              onExportSource={props.onExportSource}
               params={{
                 title: props.preview.title?.trim() || t("chat.toolCards.canvas"),
                 src: resolveCanvasIframeUrl(
@@ -425,54 +423,55 @@ function WidgetContent(props: {
           }
         >
           {(_managed) => {
-            void ensureCustomElementDefined(
-              "openclaw-canvas-widget-view",
-              loadCanvasWidgetView,
-            ).catch((error: unknown) =>
-              console.error("[openclaw] failed to load widget view", error),
-            );
             return (
-              <CanvasWidgetMount
-                docId={props.preview.viewId!.trim()}
-                sessionKey={props.options?.sessionKey ?? ""}
-                messageTimestamp={props.options?.messageTimestamp}
-                title={props.preview.title?.trim() || t("chat.toolCards.canvas")}
-                preferredHeight={
-                  props.options?.widgetLayout?.read(`canvas:${props.preview.viewId!.trim()}`) ??
-                  props.preview.preferredHeight
-                }
-                onHeightChange={(height) =>
-                  props.options?.widgetLayout?.write(
-                    `canvas:${props.preview.viewId!.trim()}`,
-                    height,
-                  )
-                }
-                allowScripts={props.sandbox.includes("allow-scripts")}
-                connectionGeneration={getCanvasWidgetFrameConnectionGeneration()}
-              />
+              <>
+                <WidgetRegistration
+                  tagName="openclaw-canvas-widget-view"
+                  loadModule={loadCanvasWidgetView}
+                />
+                <CanvasWidgetMount
+                  onElement={props.onExportSource}
+                  docId={props.preview.viewId!.trim()}
+                  sessionKey={props.options?.sessionKey ?? ""}
+                  messageTimestamp={props.options?.messageTimestamp}
+                  title={props.preview.title?.trim() || t("chat.toolCards.canvas")}
+                  preferredHeight={
+                    props.options?.widgetLayout?.read(`canvas:${props.preview.viewId!.trim()}`) ??
+                    props.preview.preferredHeight
+                  }
+                  onHeightChange={(height) =>
+                    props.options?.widgetLayout?.write(
+                      `canvas:${props.preview.viewId!.trim()}`,
+                      height,
+                    )
+                  }
+                  allowScripts={props.sandbox.includes("allow-scripts")}
+                  connectionGeneration={getCanvasWidgetFrameConnectionGeneration()}
+                />
+              </>
             );
           }}
         </Show>
       }
     >
       {(app) => {
-        void ensureCustomElementDefined("mcp-app-view", loadMcpAppView).catch((error: unknown) => {
-          console.error("[openclaw] failed to load MCP App view", error);
-        });
         const key = () => `mcp:${app().viewId}`;
         const height = () =>
           props.options?.widgetLayout?.read(key()) ?? props.preview.preferredHeight ?? 600;
         return (
-          <mcp-app-view
-            prop:sessionKey={props.options?.sessionKey ?? ""}
-            prop:viewId={app().viewId}
-            prop:height={height()}
-            prop:onHeightChange={(nextHeight: number) =>
-              props.options?.widgetLayout?.write(key(), nextHeight)
-            }
-            style={{ display: "block", "min-height": `${height()}px` }}
-            title={props.preview.title?.trim() || t("mcpApp.title")}
-          />
+          <>
+            <WidgetRegistration tagName="mcp-app-view" loadModule={loadMcpAppView} />
+            <mcp-app-view
+              prop:sessionKey={props.options?.sessionKey ?? ""}
+              prop:viewId={app().viewId}
+              prop:height={height()}
+              prop:onHeightChange={(nextHeight: number) =>
+                props.options?.widgetLayout?.write(key(), nextHeight)
+              }
+              style={{ display: "block", "min-height": `${height()}px` }}
+              title={props.preview.title?.trim() || t("mcpApp.title")}
+            />
+          </>
         );
       }}
     </Show>
@@ -481,7 +480,7 @@ function WidgetContent(props: {
 
 function handleWidgetExportAction(
   value: WidgetAction,
-  dropdown: HTMLElement,
+  source: WidgetExportSource,
   title: string | undefined,
   toggleRawDetails: (() => boolean) | undefined,
 ): WidgetRawDetailsLabel | void {
@@ -489,14 +488,12 @@ function handleWidgetExportAction(
   if (value === "raw-details") {
     return toggleRawDetails?.() ? "chat.toolCards.hideRawDetails" : "chat.toolCards.showRawDetails";
   }
-  const frame = dropdown
-    .closest(".chat-tool-card__preview")
-    ?.querySelector<HTMLIFrameElement>(".chat-tool-card__preview-frame");
+  const frame = source instanceof HTMLIFrameElement ? source : source?.previewFrame;
   if (!frame) {
     showToast({ message: t("chat.toolCards.widgetExportFailed") });
     return;
   }
-  const documentHtml = frame.closest("openclaw-canvas-widget-view")?.documentHtml;
+  const documentHtml = source instanceof HTMLIFrameElement ? undefined : source?.documentHtml;
   void exportWidget(value, frame, title, { documentHtml })
     .then((result) => {
       if (result === "rerender-required") {
@@ -512,53 +509,31 @@ function handleWidgetExportAction(
     });
 }
 
-function widgetActionsPlacementRef(
-  enabled: () => boolean,
-  options: () => WidgetCardOptions | undefined,
-) {
+function widgetActionsPlacementRef(enabled: () => boolean) {
   const presented = useContext(ContentPresentation);
   const active = createMemo(() => presented() && enabled());
-  let element: HTMLElement | undefined;
-  // Synchronize action placement with the transcript's DOM clipping geometry.
-  createEffect(
-    () => [active(), options()] as const,
-    ([isActive]) => {
-      if (!isActive || !element || typeof ResizeObserver === "undefined") {
+  let element!: HTMLElement;
+  const targets = () => {
+    if (!active()) {
+      return [];
+    }
+    const thread = element.closest<HTMLElement>(".chat-thread");
+    return thread ? [element, thread] : [];
+  };
+  // Keep observation stable through content updates; only geometry needs a new frame.
+  createResizeObserver(targets, () =>
+    scheduleLayout(element, () => {
+      const [target, thread] = targets();
+      if (!target || !thread) {
         return undefined;
       }
-      const target = element;
-      let thread: HTMLElement | null = null;
-      const placeActions = () => {
-        if (!thread) {
-          return undefined;
-        }
-        const clipRight =
-          thread.getBoundingClientRect().left + thread.clientLeft + thread.clientWidth;
-        const above = clipRight - target.getBoundingClientRect().right < 40;
-        return () => target.toggleAttribute("data-widget-actions-above", above);
-      };
-      const observer = new ResizeObserver(() => scheduleLayout(target, placeActions));
-      // Content updates can arrive during resize delivery. Reattach after insertion
-      // in the next frame so the shallower thread cannot become a skipped delivery.
-      scheduleLayout(target, () => {
-        const container = target.closest<HTMLElement>(".chat-thread");
-        if (!container) {
-          return undefined;
-        }
-        thread = container;
-        const place = placeActions();
-        return () => {
-          observer.observe(target);
-          observer.observe(container);
-          place?.();
-        };
-      });
-      return () => {
-        cancelLayout(target);
-        observer.disconnect();
-      };
-    },
+      const clipRight =
+        thread.getBoundingClientRect().left + thread.clientLeft + thread.clientWidth;
+      const above = clipRight - target.getBoundingClientRect().right < 40;
+      return () => element.toggleAttribute("data-widget-actions-above", above);
+    }),
   );
+  onSettled(() => () => cancelLayout(element));
   return (next: HTMLDivElement) => {
     element = next;
   };
@@ -569,6 +544,7 @@ function CanvasPreview(props: {
   surface: string;
   options?: WidgetCardOptions;
 }) {
+  let exportSource: WidgetExportSource;
   const sandbox = () =>
     resolveEmbedSandbox(props.options?.embedSandboxMode ?? "scripts", props.preview.sandbox);
   const provider = () => props.options?.boardProvider;
@@ -582,10 +558,6 @@ function CanvasPreview(props: {
         (props.preview.viewId?.trim()
           ? canvasWidgetNameForDocument(props.preview.viewId.trim())
           : undefined);
-  const pinned = () =>
-    Boolean(
-      pinName() && provider()?.snapshot$.value.widgets.find((widget) => widget.name === pinName()),
-    );
   const canPin = () => {
     const board = provider();
     return (
@@ -601,11 +573,27 @@ function CanvasPreview(props: {
   const canExportImage = () => !props.preview.mcpApp && isInternalCanvasEntryUrl(props.preview.url);
   const hasMenu = () => canExportImage() || Boolean(props.options?.rawText);
   const hasActions = () => Boolean(canPin() || hasMenu());
-  const pinLabel = () =>
-    t(pinned() ? "chat.toolCards.pinnedToDashboard" : "chat.toolCards.pinToDashboard");
+  const pinTarget = createMemo(
+    (): WidgetPinTarget | undefined =>
+      canPin()
+        ? {
+            board: provider()!,
+            name: pinName()!,
+            viewId: mcpAppViewId() || props.preview.viewId!.trim(),
+            mcpApp: Boolean(props.preview.mcpApp),
+          }
+        : undefined,
+    {
+      equals: (previous, next) =>
+        previous?.board === next?.board &&
+        previous?.name === next?.name &&
+        previous?.viewId === next?.viewId &&
+        previous?.mcpApp === next?.mcpApp,
+    },
+  );
   return (
     <div
-      ref={widgetActionsPlacementRef(hasActions, () => props.options)}
+      ref={widgetActionsPlacementRef(hasActions)}
       class="chat-tool-card__preview"
       data-content-kind={props.preview.mcpApp ? "mcp-app" : "canvas-html"}
       data-has-widget-actions={hasActions() ? "" : undefined}
@@ -614,30 +602,17 @@ function CanvasPreview(props: {
     >
       <Show when={hasActions()}>
         <div class="chat-tool-card__preview-actions" data-widget-actions>
-          <Show when={canPin()}>
-            <button
-              class="btn btn--ghost btn--icon chat-tool-card__widget-action"
-              type="button"
-              data-pin-widget
-              disabled={pinned()}
-              data-pinned={pinned() ? "" : undefined}
-              title={pinLabel()}
-              aria-label={pinLabel()}
-              onClick={(event) =>
-                void pinWidget(event, props.preview, provider()!, pinName()!, mcpAppViewId())
-              }
-            >
-              <Icon name="pin" />
-            </button>
+          <Show when={pinTarget()} keyed>
+            {(target) => <WidgetPinButton target={target} title={props.preview.title} />}
           </Show>
           <Show when={hasMenu()}>
             <WidgetCardMenu
               canExportImage={canExportImage()}
               hasRawDetails={Boolean(props.options?.rawText)}
-              onAction={(value, menu) =>
+              onAction={(value) =>
                 handleWidgetExportAction(
                   value,
-                  menu,
+                  exportSource,
                   props.preview.title,
                   props.options?.toggleRawDetails,
                 )
@@ -647,7 +622,12 @@ function CanvasPreview(props: {
         </div>
       </Show>
       <div class="chat-tool-card__preview-panel" data-side="canvas">
-        <WidgetContent preview={props.preview} sandbox={sandbox()} options={props.options} />
+        <WidgetContent
+          preview={props.preview}
+          sandbox={sandbox()}
+          options={props.options}
+          onExportSource={(source) => (exportSource = source)}
+        />
       </div>
     </div>
   );
@@ -691,29 +671,29 @@ export function ToolPreview(props: ToolPreviewProps) {
                 }
               >
                 {(item) => {
-                  void ensureCustomElementDefined("openclaw-youtube-video", loadYouTubeVideo).catch(
-                    (error: unknown) =>
-                      console.error("[openclaw] failed to load YouTube player", error),
-                  );
-                  const key = createMemo(
-                    () => `${props.options?.sessionKey ?? ""}\0${item().watchUrl}`,
+                  const Fallback = () => (
+                    <openclaw-youtube-video>
+                      <a href={item().watchUrl} target="_blank" rel="noopener noreferrer">
+                        {preview().title?.trim() || t("chat.youtube.video")}
+                        <Icon name="externalLink" />
+                      </a>
+                    </openclaw-youtube-video>
                   );
                   return (
-                    <Show when={key()} keyed>
+                    <Show when={`${props.options?.sessionKey ?? ""}\0${item().watchUrl}`} keyed>
                       {(_key) => (
-                        <openclaw-youtube-video
-                          prop:video={item()}
-                          prop:videoTitle={preview().title ?? ""}
-                          prop:enabled={
-                            props.options?.embedSandboxMode !== "strict" &&
-                            preview().sandbox !== "strict"
-                          }
-                        >
-                          <a href={item().watchUrl} target="_blank" rel="noopener noreferrer">
-                            {preview().title?.trim() || t("chat.youtube.video")}
-                            <Icon name="externalLink" />
-                          </a>
-                        </openclaw-youtube-video>
+                        <Errored fallback={<Fallback />}>
+                          <Loading fallback={<Fallback />}>
+                            <YouTubeVideoCard
+                              video={item()}
+                              videoTitle={preview().title ?? ""}
+                              enabled={
+                                props.options?.embedSandboxMode !== "strict" &&
+                                preview().sandbox !== "strict"
+                              }
+                            />
+                          </Loading>
+                        </Errored>
                       )}
                     </Show>
                   );
@@ -724,13 +704,7 @@ export function ToolPreview(props: ToolPreviewProps) {
         </Show>
       }
     >
-      {(preview) => (
-        <openclaw-browser-tab-card
-          prop:preview={preview()}
-          prop:revision={props.options?.browserTabRevision}
-          prop:latest={props.options?.browserTabLatest ?? false}
-        />
-      )}
+      {(preview) => <BrowserTabCardHost preview={preview()} latest={false} />}
     </Show>
   );
 }
@@ -738,16 +712,7 @@ export function ToolPreview(props: ToolPreviewProps) {
 declare module "@solidjs/web" {
   namespace JSX {
     interface IntrinsicElements {
-      "openclaw-browser-tab-card": HTMLAttributes<HTMLElement> & {
-        "prop:preview": Extract<ToolPreviewModel, { kind: "browser-tab" }>;
-        "prop:revision"?: string;
-        "prop:latest": boolean;
-      };
-      "openclaw-youtube-video": HTMLAttributes<HTMLElement> & {
-        "prop:video": import("../../../lib/chat/youtube-video.ts").YouTubeVideo;
-        "prop:videoTitle": string;
-        "prop:enabled": boolean;
-      };
+      "openclaw-youtube-video": HTMLAttributes<HTMLElement>;
     }
   }
 }

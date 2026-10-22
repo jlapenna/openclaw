@@ -1,7 +1,6 @@
 import type { AgentRunTimeoutPhase } from "@openclaw/normalization-core/agent-run-terminal-outcome";
 import type { InlineCodeState } from "../../packages/markdown-core/src/code-spans.js";
 import type { FenceScanState } from "../../packages/markdown-core/src/fences.js";
-import type { HeartbeatToolResponse } from "../auto-reply/heartbeat-tool-response.js";
 import type { ReplyMediaAttachment } from "../auto-reply/reply-payload.js";
 import type { ReplyDirectiveParseResult } from "../auto-reply/reply/reply-directives.js";
 import type { ReasoningLevel } from "../auto-reply/thinking.js";
@@ -27,7 +26,6 @@ import { collectAgentInternalEventMedia } from "./internal-events.js";
 import type { McpConnectAction } from "./mcp-connect-action.js";
 import type { McpAppChannelView } from "./mcp-ui-resource.js";
 import type { ReplyDeliveryState } from "./reply-completion.js";
-import type { AssistantTranscriptSource } from "./sessions/assistant-transcript-source.js";
 import type { ToolErrorSummary } from "./tool-error-summary.js";
 
 /** Per-tool metadata tracked between tool start/update/end events. */
@@ -36,7 +34,6 @@ export type ToolCallSummary = {
   commandBearing: boolean;
   instanceReplaySafe: boolean;
   replaySafe: boolean;
-  mutatingAction: boolean;
   ownerKey?: string;
 };
 
@@ -83,11 +80,7 @@ export type StreamBlockState = {
 };
 
 /** A response-ending answer and the message index its reply payload belongs to. */
-export type CompletedAssistantAnswer = {
-  assistant: AssistantMessage;
-  messageIndex: number;
-  assistantTranscriptSource?: AssistantTranscriptSource;
-};
+export type CompletedAssistantAnswer = { assistant: AssistantMessage; messageIndex: number };
 
 /** Mutable subscription state shared by embedded-agent event handlers. */
 export class EmbeddedAgentSubscribeState {
@@ -97,7 +90,6 @@ export class EmbeddedAgentSubscribeState {
     messageEnd: number;
     finalMessageStart: number;
     lastAssistant: AssistantMessage;
-    assistantTranscriptSource?: AssistantTranscriptSource;
     keptAnswer?: CompletedAssistantAnswer;
     sourceReplyDeliveryState?: ReplyDeliveryState;
   }> = [];
@@ -180,8 +172,6 @@ export class EmbeddedAgentSubscribeState {
   assistantMessageIndex = 0;
   /** Physical message boundary; assistantMessageIndex also advances between content blocks. */
   assistantMessageStartIndex = 0;
-  assistantTranscriptSource?: AssistantTranscriptSource = undefined;
-  lastAssistantTranscriptSource?: AssistantTranscriptSource = undefined;
   lastAssistantStreamContentIndex?: number = undefined;
   lastAssistantStreamItemId?: string = undefined;
   lastAssistantTextMessageIndex = -1;
@@ -212,7 +202,6 @@ export class EmbeddedAgentSubscribeState {
   currentSourceMessagingToolSentTextsNormalized: string[] = [];
   currentSourceMessagingToolHeldPartial?: string = undefined;
   messagingToolSentTargets: MessagingToolSend[] = [];
-  heartbeatToolResponse?: HeartbeatToolResponse = undefined;
   messagingToolSentMediaUrls: string[] = [];
   messagingToolSourceReplyPayloads: MessagingToolSourceReplyPayload[] = [];
   messageToolOnlySourceReplyDelivered = false;

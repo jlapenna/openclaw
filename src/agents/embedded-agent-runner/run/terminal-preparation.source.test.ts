@@ -3,6 +3,7 @@ import {
   getReplyPayloadMetadata,
   setReplyPayloadMetadata,
 } from "../../../auto-reply/reply-payload.js";
+import { bindAgentAssistantSource } from "../../../infra/agent-events.js";
 import type { buildEmbeddedRunPayloads } from "./payloads.js";
 import {
   assistantMessage,
@@ -30,14 +31,17 @@ describe("prepareEmbeddedRunTerminal transcript source", () => {
         ...assistantMessage("stop"),
         content: [{ type: "text" as const, text: finalText }],
       };
+      const finalSource = { committedMessageId: "final-row" };
+      if (hasSource) {
+        bindAgentAssistantSource(finalAssistant, finalSource);
+      }
       payloadMocks.buildEmbeddedRunPayloads.mockReturnValueOnce([
         { text: completedText },
         setReplyPayloadMetadata(
           { text: partialText },
           {
             assistantTranscriptSource: {
-              occurrenceId: "partial-response",
-              messageId: "partial-row",
+              committedMessageId: "partial-row",
             },
             assistantTranscriptAggregate: true,
           },
@@ -53,14 +57,6 @@ describe("prepareEmbeddedRunTerminal transcript source", () => {
           lastAssistant: finalAssistant,
           currentAttemptAssistant: finalAssistant,
           currentAttemptCompletedAssistant: finalAssistant,
-          ...(hasSource
-            ? {
-                assistantTranscriptSource: {
-                  occurrenceId: "final-response",
-                  messageId: "final-row",
-                },
-              }
-            : {}),
         }),
         currentAttemptCompletedAssistant: finalAssistant,
         terminalState: {
@@ -78,7 +74,7 @@ describe("prepareEmbeddedRunTerminal transcript source", () => {
       const recoveredAnswer = prepared.recoveredFinalAssistantPayloadsAfterPromptTimeout?.[1];
       expect(recoveredAnswer?.text).toBe(finalText);
       expect(getReplyPayloadMetadata(recoveredAnswer!)?.assistantTranscriptSource).toEqual(
-        hasSource ? { occurrenceId: "final-response", messageId: "final-row" } : undefined,
+        hasSource ? finalSource : undefined,
       );
       expect(
         getReplyPayloadMetadata(recoveredAnswer!)?.assistantTranscriptAggregate,

@@ -1,3 +1,4 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   copyReplyPayloadMetadata,
   getReplyPayloadMetadata,
@@ -5,11 +6,16 @@ import {
 } from "../../../auto-reply/reply-payload.js";
 import { parseReplyDirectives } from "../../../auto-reply/reply/reply-directives.js";
 import { applyPreparedReplyMedia } from "../../../auto-reply/reply/reply-media-paths.js";
+import {
+  readAgentAssistantSource,
+  type AgentAssistantSourceReceipt,
+} from "../../../infra/agent-events.js";
 import type { AssistantMessage } from "../../../llm/types.js";
 import { estimateAggregateUsageCost } from "../../../utils/usage-format.js";
 import { projectAgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import type { AgentRunTerminalReceipt } from "../../agent-run-terminal-receipt.js";
 import {
+  filterAgentRunTerminalPayloadsForPresentation,
   prepareAgentRunTerminalReply,
   sanitizeAgentRunTerminalReply,
 } from "../../agent-run-terminal-reply.js";
@@ -21,7 +27,7 @@ import {
 import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
 import { isProviderModelRerouted } from "../../provider-model-route.js";
 import type { ReplyDeliveryState } from "../../reply-completion.js";
-import type { AssistantTranscriptSource } from "../../sessions/assistant-transcript-source.js";
+import { isExecLikeToolName } from "../../tool-error-summary.js";
 import { getCoreTtsAttemptResultMediaUrls } from "../../tools/tts-tool-result-provenance.js";
 import type { NormalizedUsage } from "../../usage.js";
 import {
@@ -29,9 +35,12 @@ import {
   resolveExplicitFinalSourceReplyDeliveryEvidence,
   resolveSourceReplyDelivery,
 } from "../delivery-evidence.js";
-import { resolveEmbeddedRunFailureSignal } from "../failure-signal.js";
 import { resolveEmbeddedRunTerminalToolFailure } from "../terminal-tool-failure.js";
-import type { EmbeddedAgentMeta, EmbeddedAgentRunResult } from "../types.js";
+import type {
+  EmbeddedAgentMeta,
+  EmbeddedAgentRunResult,
+  EmbeddedRunFailureSignal,
+} from "../types.js";
 import type { UsageAccumulator } from "../usage-accumulator.js";
 import type { EmbeddedRunAttemptWithReceiptEvidence } from "./attempt-result.js";
 import type { EmbeddedRunContextRecoveryState } from "./context-recovery-state.js";
@@ -238,9 +247,6 @@ export function prepareEmbeddedRunTerminal(input: {
     ...attempt,
     preparedTerminalReply,
     assistantMessageIndex: attempt.lastAssistantTextMessageIndex,
-    assistantTranscriptSource: attempt.yieldDetected
-      ? undefined
-      : attempt.assistantTranscriptSource,
     lastAssistant: payloadAssistant,
     currentAssistant: attempt.yieldDetected ? null : (payloadAssistant ?? null),
     // A clean yield is a handoff, not a terminal tool failure. Keep the error
@@ -248,8 +254,6 @@ export function prepareEmbeddedRunTerminal(input: {
     lastToolError: cleanYield ? undefined : attempt.lastToolError,
     config: runParams.config,
     isCronTrigger: runParams.trigger === "cron",
-    // A conversation's continuation keeps conversational silence and failure reporting.
-    isHeartbeatTrigger: runParams.trigger === "heartbeat" && !runParams.continuesConversation,
     sessionKey: runParams.sessionKey ?? runParams.sessionId,
     provider: input.activeErrorContext.provider,
     providerOwner: input.providerOwner,
@@ -313,9 +317,14 @@ export function prepareEmbeddedRunTerminal(input: {
           },
           runParams.admittedRunContext?.operationalRunInstance,
         );
+  // Compaction can outlive an already completed current answer. Keep that final
+  // through the same scoped recovery path as a late prompt timeout.
+  const canRecoverCompletedAnswer =
+    timedOutDuringPrompt ||
+    (timedOutDuringCompaction && isEmbeddedRunTerminalTimeout(input.terminalState.outcome));
   const recoveredFinalAssistantTextAfterPromptTimeout =
     sourceReplyDeliveryState === "missing" &&
-    timedOutDuringPrompt &&
+    canRecoverCompletedAnswer &&
     !timeoutFinal &&
     ["completed", "end_turn", "stop"].includes(finalAssistantStopReason)
       ? (finalAssistantVisibleText ?? finalAssistantRawText)?.trim()
@@ -336,13 +345,11 @@ export function prepareEmbeddedRunTerminal(input: {
           payloads: payloadsWithToolMedia,
           assistantTexts: attempt.assistantTexts,
           recoveredText: recoveredFinalAssistantTextAfterPromptTimeout,
-          assistantTranscriptSource: attempt.keptAnswer
-            ? attempt.keptAnswer.assistantTranscriptSource
-            : attempt.assistantTranscriptSource,
+          assistantTranscriptSource: readAgentAssistantSource(answerAssistant),
         })
       : undefined;
   const hasSuccessfulFinalAssistantAfterPromptTimeout =
-    timedOutDuringPrompt &&
+    canRecoverCompletedAnswer &&
     Boolean(
       payloadAlreadyContainsRecoveredFinalAssistant ||
       recoveredFinalAssistantPayloadsAfterPromptTimeout?.length,
@@ -356,11 +363,27 @@ export function prepareEmbeddedRunTerminal(input: {
     !attempt.didSendDeterministicApprovalPrompt &&
     !attempt.lastToolError &&
     (attempt.toolMetas?.length ?? 0) === 0;
-  const attemptToolSummary = buildTraceToolSummary(attempt);
-  const failureSignal = resolveEmbeddedRunFailureSignal({
-    trigger: runParams.trigger,
-    lastToolError: attempt.lastToolError,
+  const payloadsForVisibleCompletion = filterAgentRunTerminalPayloadsForPresentation({
+    payloads: recoveredFinalAssistantPayloadsAfterPromptTimeout ?? payloadsWithToolMedia,
   });
+  const attemptToolSummary = buildTraceToolSummary(attempt);
+  // Cron execution denials must not look like successful silent completions.
+  let failureSignal: EmbeddedRunFailureSignal | undefined;
+  const lastToolError = attempt.lastToolError;
+  if (runParams.trigger === "cron" && lastToolError && isExecLikeToolName(lastToolError.toolName)) {
+    const code = normalizeOptionalString(lastToolError.errorCode);
+    if (code === "SYSTEM_RUN_DENIED" || code === "INVALID_REQUEST") {
+      const message = normalizeOptionalString(lastToolError.error) ?? code;
+      failureSignal = {
+        kind: "execution_denied",
+        source: "tool",
+        toolName: lastToolError.toolName,
+        code,
+        message,
+        fatalForCron: true,
+      };
+    }
+  }
   const terminalToolFailure = resolveEmbeddedRunTerminalToolFailure({
     trigger: runParams.trigger,
     codeModeEngaged: attempt.codeModeEngaged,
@@ -377,6 +400,7 @@ export function prepareEmbeddedRunTerminal(input: {
     finalAssistantMessageRawText,
     payloads,
     payloadsWithToolMedia,
+    payloadsForVisibleCompletion,
     timedOutDuringPrompt,
     recoveredFinalAssistantPayloadsAfterPromptTimeout,
     hasSuccessfulFinalAssistantAfterPromptTimeout,
@@ -391,7 +415,7 @@ function replacePartialAssistantPayload(input: {
   payloads: EmbeddedAgentRunResult["payloads"];
   assistantTexts?: string[];
   recoveredText: string;
-  assistantTranscriptSource?: AssistantTranscriptSource;
+  assistantTranscriptSource?: Readonly<AgentAssistantSourceReceipt>;
 }): NonNullable<EmbeddedAgentRunResult["payloads"]> {
   const payloads = input.payloads ? [...input.payloads] : [];
   const assistantTextSignatures = new Set(
@@ -422,8 +446,8 @@ function replacePartialAssistantPayload(input: {
       ...partialPayload,
       text: input.recoveredText,
     }),
-    // Recovery replaces the text's source, not just its display. Missing custody
-    // cannot inherit the partial payload's unrelated occurrence.
+    // Replacement text belongs to the recovered answer, even when that answer
+    // has no receipt. Never retain the partial response's unrelated custody.
     {
       localTranscriptDeliveryConfirmed: undefined,
       assistantTranscriptSource: input.assistantTranscriptSource,

@@ -1,5 +1,6 @@
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import type {
   ReplyDeliveryFactsObserver,
   ReplyDeliveryState,
@@ -13,7 +14,6 @@ import {
   getReplyPayloadMetadata,
   isReplyPayloadStatusNotice,
   stripReplyMediaFailureFallback,
-  type ReplyPayload,
 } from "../../auto-reply/reply-payload.js";
 import type { ReplyDispatcherOptions } from "../../auto-reply/reply/reply-dispatcher.js";
 import type { ReplyDispatchOperation } from "../../auto-reply/reply/reply-dispatcher.types.js";
@@ -61,14 +61,19 @@ import {
 } from "./chat-send-command-replies.js";
 import { createAssistantCommentaryMediaCustody } from "./chat-send-commentary-media.js";
 import { resolveChatReplyDeliveryFromAnchors } from "./chat-send-reply-delivery.js";
-import { retainCommittedChatReplyMedia } from "./chat-send-reply-finalization.js";
+import {
+  agentMediaTranscriptKey,
+  retainCommittedChatReplyMedia,
+  selectAgentMediaTranscriptInputs,
+} from "./chat-send-reply-finalization.js";
 import { createChatReplySessionReader, type ChatReplySession } from "./chat-send-reply-session.js";
 import { appendInjectedAssistantMessageToTranscript } from "./chat-transcript-inject.js";
+import { rewriteAssistantTranscriptMessageById } from "./chat-transcript-media-enrichment.js";
 import {
   assistantTranscriptScope,
   publishAssistantTranscriptRewrite,
   rewriteAssistantTranscriptMessageByIdempotencyKey,
-  rewriteAssistantTranscriptMessageByIdAndMedia,
+  rewriteAssistantTranscriptMessageByTurnIndexAndMedia,
 } from "./chat-transcript-persistence.js";
 import {
   buildTtsSupplementTranscriptMarker,
@@ -300,31 +305,18 @@ export function createChatSendReplyDispatch(params: {
       retainedSource?.release();
     }
   };
-  const needsAgentMediaTranscriptFinalization = (payload: ReplyPayload): boolean =>
-    isMediaBearingPayload(payload) ||
-    Boolean(getReplyPayloadMetadata(payload)?.assistantMediaFailures?.length);
-  const agentMediaTranscriptKey = (payload: ReplyPayload): string => {
-    const metadata = getReplyPayloadMetadata(payload);
-    const ownedIdempotencyKey =
-      metadata?.assistantTranscriptOwned === true
-        ? metadata.assistantTranscriptIdempotencyKey?.trim()
-        : undefined;
-    if (ownedIdempotencyKey) {
-      return `owned:${ownedIdempotencyKey}`;
-    }
-    const contentIndex = metadata?.assistantMessageIndex;
-    if (metadata?.assistantTranscriptSource) {
-      const sourceKey = `source:${metadata.assistantTranscriptSource.occurrenceId}`;
-      return contentIndex === undefined ? sourceKey : `${sourceKey}:index:${contentIndex}`;
-    }
-    return contentIndex === undefined ? "unkeyed" : `index:${contentIndex}`;
-  };
-  const appendWebchatAgentMediaTranscriptIfNeeded = async (input: ReplyDispatchOperation) => {
-    const payload = readChatSendReplyPayload(input);
-    if (!isAgentRunStarted() || !needsAgentMediaTranscriptFinalization(payload)) {
+  const appendWebchatAgentMediaTranscriptIfNeeded = async (
+    inputs: readonly ReplyDispatchOperation[],
+  ) => {
+    const input = inputs[0];
+    if (!input) {
       return;
     }
+    const payload = readChatSendReplyPayload(input);
     const finalizationKey = agentMediaTranscriptKey(payload);
+    if (!isAgentRunStarted() || !finalizationKey) {
+      return;
+    }
     if (finalizedAgentMediaTranscriptKeys.has(finalizationKey)) {
       return;
     }
@@ -363,7 +355,7 @@ export function createChatSendReplyDispatch(params: {
       );
       const sessionId = latestEntry?.sessionId ?? backingSessionId ?? clientRunId;
       const {
-        payloads: [transcriptPayload],
+        payloads: transcriptPayloads,
         inputs: transcriptInputs,
         mediaMessage,
         assistantContent,
@@ -372,16 +364,23 @@ export function createChatSendReplyDispatch(params: {
       } = await prepareWebchatReplyMediaForDisplay({
         scope: mediaScope,
         storePath: latestStorePath,
-        inputs: replaceChatSendReplyPayload(input, stripVisibleTextFromTtsSupplement(payload)),
+        inputs: inputs.flatMap((part) =>
+          replaceChatSendReplyPayload(
+            part,
+            stripVisibleTextFromTtsSupplement(readChatSendReplyPayload(part)),
+          ),
+        ),
         abortSignal: params.abortSignal,
-        includeSensitiveMedia: payload.sensitiveMedia !== true,
+        includeSensitiveMedia: false,
         logGateway,
       });
+      const transcriptPayload = transcriptPayloads[0];
       if (!transcriptPayload) {
         return;
       }
-      const transcriptPayloadMetadata = getReplyPayloadMetadata(transcriptPayload);
-      const mediaFailures = transcriptPayloadMetadata?.assistantMediaFailures ?? [];
+      const mediaFailures = transcriptPayloads.flatMap(
+        (part) => getReplyPayloadMetadata(part)?.assistantMediaFailures ?? [],
+      );
       const mediaNormalizationFailed = mediaFailures.length > 0;
       const persistedContentForAppend =
         hasAssistantDisplayMediaContent(persistedAssistantContent) || mediaNormalizationFailed
@@ -396,12 +395,11 @@ export function createChatSendReplyDispatch(params: {
         buildTranscriptReplyTextFromInputs(transcriptInputs);
       const payloadMetadata = getReplyPayloadMetadata(payload);
       const sourceMediaUrls = uniqueStrings(
-        payloadMetadata?.assistantTranscriptMediaUrls?.length
-          ? payloadMetadata.assistantTranscriptMediaUrls
-          : [
-              ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : []),
-              ...(typeof payload.mediaUrl === "string" ? [payload.mediaUrl] : []),
-            ],
+        inputs.flatMap((part) => {
+          const partPayload = readChatSendReplyPayload(part);
+          const urls = getReplyPayloadMetadata(partPayload)?.assistantTranscriptMediaUrls;
+          return urls?.length ? urls : resolveSendableOutboundReplyParts(partPayload).mediaUrls;
+        }),
       );
       const ownedTranscriptIdempotencyKey =
         transcript?.idempotencyKey ??
@@ -416,8 +414,9 @@ export function createChatSendReplyDispatch(params: {
       });
       const assistantMessageIndex = payloadMetadata?.assistantMessageIndex;
       const assistantSource = payloadMetadata?.assistantTranscriptSource;
+      const assistantTranscriptMessageId = assistantSource?.committedMessageId;
       let rewritten: { messageId: string } | null = null;
-      if (ownedTranscriptIdempotencyKey && transcriptScope) {
+      if (ownedTranscriptIdempotencyKey && transcriptScope && !ttsSupplementMarker) {
         // Receipt identity is not authority after asynchronous media preparation.
         if (
           transcript &&
@@ -441,15 +440,44 @@ export function createChatSendReplyDispatch(params: {
           );
           return;
         }
-      } else if (assistantSource?.messageId && transcriptScope) {
-        // This physical append's receipt settles after streaming callbacks. Stream
-        // indices count content items and restart on retries; they cannot select a row.
+      } else if (assistantTranscriptMessageId && transcriptScope && !ttsSupplementMarker) {
+        // The persistence receipt identifies the occurrence; a later input projection
+        // can rotate the transcript generation without changing this assistant reply.
+        const exactRewrite = await rewriteAssistantTranscriptMessageById({
+          messageId: assistantTranscriptMessageId,
+          runId: agentRunId,
+          content: persistedContentForAppend,
+          mediaBySource,
+          mediaUrls: sourceMediaUrls,
+          expectedLifecycleRevision: assistantTranscriptRewriteState?.lifecycleRevision ?? null,
+          scope: transcriptScope,
+          assertCurrent: mediaScope.assertCurrent,
+          abortSignal: params.abortSignal,
+        });
+        if (!exactRewrite) {
+          logGateway.warn(
+            "webchat assistant media rewrite skipped: committed occurrence unavailable",
+          );
+          return;
+        }
+        if (assistantTranscriptRewriteState) {
+          assistantTranscriptRewriteState.generation = exactRewrite.generation;
+        }
+        rewritten = exactRewrite;
+      } else if (
+        !assistantSource &&
+        assistantMessageIndex !== undefined &&
+        transcriptScope &&
+        !ttsSupplementMarker
+      ) {
+        // Embedded runtimes identify their owned turn by message index, not a persisted key.
+        // Require that exact current-turn row and media set so a sibling reply cannot be rewritten.
         if (assistantTranscriptRewriteState?.sessionId !== sessionId) {
           return;
         }
-        const sourceRewrite = await rewriteAssistantTranscriptMessageByIdAndMedia({
+        const indexedRewrite = await rewriteAssistantTranscriptMessageByTurnIndexAndMedia({
           afterSeq: assistantTranscriptRewriteState.afterSeq,
-          messageId: assistantSource.messageId,
+          assistantMessageIndex,
           content: persistedContentForAppend,
           mediaBySource,
           expectedGeneration: assistantTranscriptRewriteState.generation,
@@ -459,9 +487,9 @@ export function createChatSendReplyDispatch(params: {
           ).length,
           scope: transcriptScope,
         });
-        if (sourceRewrite) {
-          assistantTranscriptRewriteState.generation = sourceRewrite.generation;
-          rewritten = sourceRewrite;
+        if (indexedRewrite) {
+          assistantTranscriptRewriteState.generation = indexedRewrite.generation;
+          rewritten = indexedRewrite;
         }
       }
       if (rewritten && transcriptScope) {
@@ -510,6 +538,13 @@ export function createChatSendReplyDispatch(params: {
       const appendContent = isRuntimeMediaSupplement
         ? persistedContentForAppend.filter((block) => block.type !== "text")
         : persistedContentForAppend;
+      const sourceId = assistantSource?.itemId ?? assistantSource?.committedMessageId;
+      const supplementBaseKey = sourceId
+        ? `${clientRunId}:assistant-media:${sourceId}${assistantMessageIndex === undefined ? "" : `:index:${assistantMessageIndex}`}`
+        : `${clientRunId}:assistant-media${assistantMessageIndex === undefined ? "" : `:${assistantMessageIndex}`}`;
+      const supplementIdempotencyKey = ttsSupplementMarker
+        ? `${supplementBaseKey}:tts:${ttsSupplementMarker.textSha256}`
+        : supplementBaseKey;
       const appended = await appendInjectedAssistantMessageToTranscript({
         sessionKey,
         message: isRuntimeMediaSupplement ? "" : transcriptReply,
@@ -517,11 +552,9 @@ export function createChatSendReplyDispatch(params: {
         sessionId,
         storePath: latestStorePath,
         agentId,
-        // Even a hook-suppressed append retains its own occurrence. Never invent
-        // row identity from a stream index, or repeat provider text in a supplement.
-        idempotencyKey: assistantSource
-          ? `${clientRunId}:assistant-media:${assistantSource.occurrenceId}${assistantMessageIndex === undefined ? "" : `:index:${assistantMessageIndex}`}`
-          : `${clientRunId}:assistant-media${assistantMessageIndex === undefined ? "" : `:${assistantMessageIndex}`}`,
+        // A suppressed append still owns its occurrence. Stream indices can restart
+        // across retries and cannot identify either the row or its media supplement.
+        idempotencyKey: supplementIdempotencyKey,
         ttsSupplement: ttsSupplementMarker,
         config: cfg,
         onMessageCommitted: retainCommittedChatReplyMedia,
@@ -599,84 +632,9 @@ export function createChatSendReplyDispatch(params: {
     deliverPrepared: (plan, info) => deliverInput({ kind: "prepared", plan }, info),
   };
   const finalizeAgentMediaTranscript = async () => {
-    const latestPayloadByKey = new Map<string, ReplyDispatchOperation>();
-    const latestPayloadByOccurrence = new Map<string, ReplyDispatchOperation>();
-    for (const { input } of deliveredReplies) {
-      const payload = readChatSendReplyPayload(input);
-      if (!needsAgentMediaTranscriptFinalization(payload)) {
-        continue;
-      }
-      const key = agentMediaTranscriptKey(payload);
-      // Replacements retain first-seen materialization order. Aggregate selection
-      // separately follows actual delivery, even when it reuses an earlier index.
-      latestPayloadByKey.set(key, input);
-      const source = getReplyPayloadMetadata(payload)?.assistantTranscriptSource;
-      if (source && key.startsWith("source:")) {
-        latestPayloadByOccurrence.set(source.occurrenceId, input);
-      }
-    }
-    const byOccurrence = new Map<string, ReplyDispatchOperation[]>();
-    for (const [key, input] of latestPayloadByKey) {
-      const source = getReplyPayloadMetadata(
-        readChatSendReplyPayload(input),
-      )?.assistantTranscriptSource;
-      if (!source || !key.startsWith("source:")) {
-        continue;
-      }
-      const group = byOccurrence.get(source.occurrenceId) ?? [];
-      group.push(input);
-      byOccurrence.set(source.occurrenceId, group);
-    }
-    const payloadMediaUrls = (payload: ReplyPayload) =>
-      uniqueStrings([
-        ...(payload.mediaUrls ?? []),
-        ...(payload.mediaUrl ? [payload.mediaUrl] : []),
-      ]);
-    const failureKeys = (payload: ReplyPayload) =>
-      (getReplyPayloadMetadata(payload)?.assistantMediaFailures ?? []).map((failure) =>
-        JSON.stringify([failure.code, failure.kind, failure.label, failure.mimeType ?? null]),
-      );
-    for (const [occurrenceId, group] of byOccurrence) {
-      const latest = latestPayloadByOccurrence.get(occurrenceId);
-      if (!latest || group.length < 2) {
-        continue;
-      }
-      const latestPayload = readChatSendReplyPayload(latest);
-      if (getReplyPayloadMetadata(latestPayload)?.assistantTranscriptAggregate !== true) {
-        continue;
-      }
-      const coveredUrls = new Set(payloadMediaUrls(latestPayload));
-      const coveredFailures = failureKeys(latestPayload);
-      const preceding = group.filter((input) => input !== latest);
-      const requiredFailures = preceding.flatMap((input) =>
-        failureKeys(readChatSendReplyPayload(input)),
-      );
-      const coversFailures = requiredFailures.every((failure) => {
-        const index = coveredFailures.indexOf(failure);
-        if (index < 0) {
-          return false;
-        }
-        coveredFailures.splice(index, 1);
-        return true;
-      });
-      // A committed receipt does not prove message_end's aggregate was delivered.
-      // Coalesce only producer-owned aggregates with actual coverage; partial/error
-      // unwind keeps each content index, including identical URLs or failure cards.
-      if (
-        !coversFailures ||
-        !preceding.every((input) =>
-          payloadMediaUrls(readChatSendReplyPayload(input)).every((url) => coveredUrls.has(url)),
-        )
-      ) {
-        continue;
-      }
-      for (const input of preceding) {
-        latestPayloadByKey.delete(agentMediaTranscriptKey(readChatSendReplyPayload(input)));
-      }
-    }
-    for (const input of latestPayloadByKey.values()) {
+    for (const inputs of selectAgentMediaTranscriptInputs(deliveredReplies)) {
       try {
-        await appendWebchatAgentMediaTranscriptIfNeeded(input);
+        await appendWebchatAgentMediaTranscriptIfNeeded(inputs);
       } catch (error) {
         logGateway.warn(`webchat media finalization failed: ${formatForLog(error)}`);
       }

@@ -1,10 +1,13 @@
+import fs from "node:fs/promises";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it } from "vitest";
+import { createPlaybackMediaFixture } from "../../../test/fixtures/media-playback.js";
 import { sessionManagerReadTranscriptStart } from "../../agents/sessions/session-manager-current-turn.js";
 import { SessionManager } from "../../agents/sessions/session-manager.js";
 import { setReplyPayloadMetadata, type ReplyMediaFailure } from "../../auto-reply/reply-payload.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import { loadTranscriptEventsSync } from "../../config/sessions/session-accessor.js";
+import type { AgentAssistantSourceReceipt } from "../../infra/agent-events.types.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { TINY_PNG_BASE64 } from "./chat-message.test-fixtures.js";
 import { createReplyTranscriptFixture } from "./chat-send-reply-dispatch.test-support.js";
@@ -42,10 +45,10 @@ it.each(["identical", "streamed-tail", "superseded-media", "suppressed-append"] 
                 },
               ],
             };
-            const source = { occurrenceId: messageId, messageId: undefined as string | undefined };
+            const source: AgentAssistantSourceReceipt = { itemId: messageId };
             if (scenario !== "suppressed-append") {
               await append(messageId, message);
-              source.messageId = messageId;
+              source.committedMessageId = messageId;
               canonical.set(messageId, message);
             }
             // Real retries can reuse the same index; media-only suppression and
@@ -73,7 +76,6 @@ it.each(["identical", "streamed-tail", "superseded-media", "suppressed-append"] 
           await dispatcher.waitForIdle();
         },
       );
-      expect(dispatch.hasAppendedWebchatAgentMedia()).toBe(true);
       const messages = loadTranscriptEventsSync(scope).flatMap((event) =>
         isRecord(event) && isRecord(event.message) && event.message.role === "assistant"
           ? [{ id: event.id, message: event.message }]
@@ -105,10 +107,7 @@ it.each(["identical", "streamed-tail", "superseded-media", "suppressed-append"] 
 it.each([
   "uncommitted-unwind",
   "committed-unwind",
-  "index-only-unwind",
   "identical-url-unwind",
-  "repeated-index",
-  "completed-aggregate",
   "completed-aggregate-first-index",
 ] as const)("retains delivered media within one assistant occurrence (%s)", async (scenario) => {
   await withOpenClawTestState({ label: "chat-media-content-index" }, async (state) => {
@@ -122,7 +121,7 @@ it.each([
     for (const mediaUrl of mediaUrls) {
       await fs.writeFile(mediaUrl, Buffer.from(TINY_PNG_BASE64, "base64"));
     }
-    const source = { occurrenceId: "shared-response", messageId: undefined as string | undefined };
+    const source: AgentAssistantSourceReceipt = { itemId: "shared-response" };
     const canonical = {
       role: "assistant",
       content: [
@@ -141,15 +140,15 @@ it.each([
       ).toBe(true);
       if (scenario === "committed-unwind" || isCompletedAggregate) {
         await append("canonical-response", canonical);
-        source.messageId = "canonical-response";
+        source.committedMessageId = "canonical-response";
       }
       for (const [index, mediaUrl] of mediaUrls.entries()) {
         dispatcher.sendBlockReply(
           setReplyPayloadMetadata(
             { mediaUrl, mediaUrls: [mediaUrl] },
             {
-              assistantMessageIndex: scenario === "repeated-index" ? 1 : index + 1,
-              assistantTranscriptSource: scenario === "index-only-unwind" ? undefined : source,
+              assistantMessageIndex: index + 1,
+              assistantTranscriptSource: source,
               assistantTranscriptMediaUrls: [mediaUrl],
             },
           ),
@@ -193,20 +192,20 @@ it.each([
           )
         : [],
     );
-    expect(imageBlocks).toHaveLength(scenario === "repeated-index" ? 1 : 2);
-    if (scenario !== "repeated-index" && scenario !== "identical-url-unwind") {
+    expect(imageBlocks).toHaveLength(2);
+    if (scenario !== "identical-url-unwind") {
       expect(new Set(imageBlocks.map((block) => JSON.stringify(block))).size).toBe(2);
     }
     if (isCompletedAggregate) {
       expect(messages).toHaveLength(1);
     }
-    if (source.messageId) {
-      expect(messages.find(({ id }) => id === source.messageId)?.message.content).toEqual(
+    if (source.committedMessageId) {
+      expect(messages.find(({ id }) => id === source.committedMessageId)?.message.content).toEqual(
         canonical.content,
       );
     }
     for (const { id, message } of messages) {
-      if (id !== source.messageId) {
+      if (id !== source.committedMessageId) {
         expect(message.content).toEqual([]);
       }
     }
@@ -237,7 +236,7 @@ it.each(["distinct", "equal"] as const)(
               { text: "Attachment failed." },
               {
                 assistantMessageIndex: index + 1,
-                assistantTranscriptSource: { occurrenceId: "shared-failures" },
+                assistantTranscriptSource: { itemId: "shared-failures" },
                 assistantMediaFailures: [failure],
               },
             ),
@@ -267,4 +266,84 @@ it.each(["distinct", "equal"] as const)(
     });
   },
 );
-import fs from "node:fs/promises";
+
+it.each(["committed", "suppressed", "indexed", "unkeyed", "owned"] as const)(
+  "keeps source media beside its spoken supplement (%s)",
+  async (identity) => {
+    const committed = identity === "committed" || identity === "owned";
+    await withOpenClawTestState({ label: "chat-media-tts-source" }, async (state) => {
+      const { scope, runId, append, dispatch } = await createReplyTranscriptFixture();
+      const imageUrl = state.statePath("media", "preview.png");
+      const audioUrl = state.statePath("media", "voice.mp3");
+      await fs.mkdir(state.statePath("media"), { recursive: true });
+      await fs.writeFile(imageUrl, Buffer.from(TINY_PNG_BASE64, "base64"));
+      await fs.writeFile(audioUrl, createPlaybackMediaFixture("mp3"));
+      const source: AgentAssistantSourceReceipt = { itemId: "spoken-source" };
+      const content = [
+        { type: "text", text: `Answer.\nMEDIA:${imageUrl}`, textSignature: "signed-answer" },
+      ];
+      const manager = await SessionManager.openAsync(scope);
+      const dispatcher = createReplyDispatcher(dispatch.dispatcherOptions);
+      await dispatch.runAgentMediaTranscript({ run: async (run) => run() }, async () => {
+        dispatch.captureAgentTranscriptStart(runId, manager[sessionManagerReadTranscriptStart]());
+        if (committed) {
+          await append("spoken-source", {
+            role: "assistant",
+            content,
+            ...(identity === "owned" ? { idempotencyKey: "owned-spoken-source" } : {}),
+          });
+          source.committedMessageId = "spoken-source";
+        }
+        for (const [mediaUrl, speech] of [
+          [imageUrl, false],
+          [audioUrl, true],
+        ] as const) {
+          dispatcher.sendFinalReply(
+            setReplyPayloadMetadata(
+              {
+                text: "Answer.",
+                mediaUrl,
+                mediaUrls: [mediaUrl],
+                trustedLocalMedia: true,
+                ...(speech ? { ttsSupplement: { spokenText: "Answer." }, audioAsVoice: true } : {}),
+              },
+              {
+                ...(identity === "unkeyed" ? {} : { assistantMessageIndex: 1 }),
+                ...(identity === "indexed" || identity === "unkeyed"
+                  ? {}
+                  : { assistantTranscriptSource: source }),
+                ...(identity === "owned"
+                  ? {
+                      assistantTranscriptOwned: true,
+                      assistantTranscriptIdempotencyKey: "owned-spoken-source",
+                    }
+                  : {}),
+                assistantTranscriptMediaUrls: [mediaUrl],
+              },
+            ),
+          );
+        }
+        dispatcher.markComplete();
+        await dispatcher.waitForIdle();
+      });
+      const rows = loadTranscriptEventsSync(scope).flatMap((event) =>
+        isRecord(event) && isRecord(event.message) && event.message.role === "assistant"
+          ? [event.message]
+          : [],
+      );
+      expect(rows).toHaveLength(2);
+      const displays = rows.map((row) =>
+        Array.isArray(row.openclawDisplayContent) ? row.openclawDisplayContent : [],
+      );
+      expect(
+        displays[0]?.filter((block) => isRecord(block) && block.type === "image"),
+      ).toHaveLength(1);
+      expect(
+        displays[1]?.filter((block) => isRecord(block) && block.type === "audio"),
+      ).toHaveLength(1);
+      if (committed) {
+        expect(rows[0]?.content).toEqual(content);
+      }
+    });
+  },
+);

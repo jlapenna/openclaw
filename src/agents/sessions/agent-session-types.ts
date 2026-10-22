@@ -1,7 +1,6 @@
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { ImageContent, Model } from "../../llm/types.js";
 import type { Agent, AgentEvent, AgentMessage, ThinkingLevel } from "../runtime/index.js";
-import type { AssistantTranscriptSource } from "./assistant-transcript-source.js";
 import type {
   ExtensionCommandContextActions,
   ExtensionErrorListener,
@@ -47,16 +46,14 @@ type AgentSessionCompactionEndEvent = {
 };
 
 export type AgentSessionEvent =
-  | (Exclude<AgentEvent, { type: "agent_end" }> & {
-      assistantTranscriptSource?: AssistantTranscriptSource;
-    })
+  | Exclude<AgentEvent, { type: "agent_end" }>
   | {
       type: "agent_end";
       messages: AgentMessage[];
       willRetry: boolean;
       assistantEntryId?: string;
     }
-  | { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
+  | { type: "queue_update" }
   | { type: "agent_settled" }
   | { type: "agent_handoff" }
   | {
@@ -68,14 +65,8 @@ export type AgentSessionEvent =
   | { type: "session_info_changed"; name: string | undefined }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
   | AgentSessionCompactionEndEvent
-  | {
-      type: "auto_retry_start";
-      attempt: number;
-      maxAttempts: number;
-      delayMs: number;
-      errorMessage: string;
-    }
-  | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+  | { type: "auto_retry_start" }
+  | { type: "auto_retry_end" };
 
 export type AgentSessionEventListener = (event: AgentSessionEvent) => unknown;
 export type AgentSessionWriteSettlementRunner = <T>(run: () => Promise<T> | T) => Promise<T>;

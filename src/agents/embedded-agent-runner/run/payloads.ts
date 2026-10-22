@@ -1,9 +1,5 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { SourceReplyDeliveryMode } from "../../../auto-reply/get-reply-options.types.js";
-import {
-  createHeartbeatToolResponsePayload,
-  type HeartbeatToolResponse,
-} from "../../../auto-reply/heartbeat-tool-response.js";
 import { buildProviderLoginRecovery } from "../../../auto-reply/provider-login-recovery.js";
 import {
   addReplyPayloadMediaFailures,
@@ -16,9 +12,9 @@ import {
 } from "../../../auto-reply/reply-payload.js";
 import { parseReplyDirectives } from "../../../auto-reply/reply/reply-directives.js";
 import type { ReasoningLevel, ThinkLevel, VerboseLevel } from "../../../auto-reply/thinking.js";
-import { HEARTBEAT_TOKEN } from "../../../auto-reply/tokens.js";
 import { applyAssistantDeliveryDirectives } from "../../../config/sessions/transcript-assistant-delivery.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { readAgentAssistantSource } from "../../../infra/agent-events.js";
 import { hasReplyPayloadContent } from "../../../interactive/payload.js";
 import type { AssistantMessage } from "../../../llm/types.js";
 import { resolveRawAssistantAnswerText } from "../../../shared/assistant-answer-text.js";
@@ -54,7 +50,6 @@ import { isTimeoutErrorMessage } from "../../failover/classify.js";
 import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
 import { renderRateLimitRetryExhaustion } from "../../failover/user-copy.js";
 import type { ReplyDeliveryState } from "../../reply-completion.js";
-import type { AssistantTranscriptSource } from "../../sessions/assistant-transcript-source.js";
 import type { ToolErrorSummary } from "../../tool-error-summary.js";
 import {
   hasCompletedMessagingToolDeliveryEvidence,
@@ -119,7 +114,6 @@ export function buildEmbeddedRunPayloads(params: {
   answerSegments?: EmbeddedAgentSubscribeState["answerSegments"];
   keptAnswer?: EmbeddedAgentSubscribeState["keptAnswer"];
   assistantMessageIndex?: number;
-  assistantTranscriptSource?: AssistantTranscriptSource;
   assistantTranscriptOwned?: boolean;
   assistantTranscriptIdempotencyKey?: string;
   lastAssistant: AssistantMessage | undefined;
@@ -128,7 +122,6 @@ export function buildEmbeddedRunPayloads(params: {
   config?: OpenClawConfig;
   sandboxRuntime?: EmbeddedRunAttemptResult["sandboxRuntime"];
   isCronTrigger?: boolean;
-  isHeartbeatTrigger?: boolean;
   sessionKey: string;
   provider?: string;
   providerOwner?: PreparedProviderFailoverOwner;
@@ -152,20 +145,8 @@ export function buildEmbeddedRunPayloads(params: {
   deferAssistantTimeoutError?: boolean;
   rateLimitRetriesExhausted?: number;
   didSendDeterministicApprovalPrompt?: boolean;
-  heartbeatToolResponse?: HeartbeatToolResponse;
 }): ReplyPayload[] {
   const sourceReplyPending = params.sourceReplyDeliveryState === "pending";
-  const heartbeatToolResponse = sourceReplyPending ? undefined : params.heartbeatToolResponse;
-  const heartbeatTerminalToolFailure =
-    !sourceReplyPending &&
-    params.isHeartbeatTrigger === true &&
-    params.lastToolError &&
-    params.lastToolError.mutatingAction === true
-      ? { toolName: params.lastToolError.toolName }
-      : undefined;
-  if (heartbeatToolResponse && !heartbeatTerminalToolFailure) {
-    return [createHeartbeatToolResponsePayload(heartbeatToolResponse)];
-  }
   // Internal source replies always need transcript/UI mirrors. A committed
   // tool-authored batch replaces the model answer in either delivery mode.
   const sourceReplyStateFor = (payloads: MessagingToolSourceReplyPayload[]) =>
@@ -180,13 +161,6 @@ export function buildEmbeddedRunPayloads(params: {
   );
   const replyItems = ordinarySourceReplies.replyItems;
   const pendingAuthoredReplies = new Set(sourceReplies.filter((payload) => payload.toolAuthored));
-  if (heartbeatToolResponse) {
-    const heartbeatPayload = createHeartbeatToolResponsePayload(heartbeatToolResponse);
-    replyItems.push({
-      text: heartbeatPayload.text ?? "",
-      ...(heartbeatPayload.channelData ? { channelData: heartbeatPayload.channelData } : {}),
-    });
-  }
   const useMarkdown = params.toolResultFormat === "markdown";
   let suppressFailureArtifacts = false;
   let hasUserFacingReply = false;
@@ -196,7 +170,6 @@ export function buildEmbeddedRunPayloads(params: {
     lastAssistant,
     currentAssistant,
     assistantMessageIndex: terminalMessageIndex,
-    assistantTranscriptSource,
     keptAnswer,
     sourceReplyDeliveryState,
     rateLimitRetriesExhausted,
@@ -206,7 +179,6 @@ export function buildEmbeddedRunPayloads(params: {
     | "lastAssistant"
     | "currentAssistant"
     | "assistantMessageIndex"
-    | "assistantTranscriptSource"
     | "keptAnswer"
     | "sourceReplyDeliveryState"
     | "rateLimitRetriesExhausted"
@@ -221,7 +193,6 @@ export function buildEmbeddedRunPayloads(params: {
         ? completedSourceReplyViaMessageTool
         : ordinarySourceReplies.deliveredSourceReplyViaMessageTool;
     const suppressAssistantArtifacts =
-      heartbeatToolResponse !== undefined ||
       params.didSendDeterministicApprovalPrompt === true ||
       (params.sourceReplyDeliveryMode === "message_tool_only" &&
         ordinarySourceReplies.hasSourceReplyPayload) ||
@@ -233,8 +204,7 @@ export function buildEmbeddedRunPayloads(params: {
     // Silence belongs to this input's answer. An earlier steered input must not
     // hide a later input that actually failed without producing an answer.
     hasIntentionalSilentFinal = false;
-    hasUserFacingReply =
-      completedSourceReplyViaMessageTool || heartbeatToolResponse?.notify === true;
+    hasUserFacingReply = completedSourceReplyViaMessageTool;
     const authoredReplies = [...pendingAuthoredReplies].filter((payload) =>
       isToolAuthoredSourceReplyForAssistant(payload, currentAssistant ?? lastAssistant),
     );
@@ -265,9 +235,6 @@ export function buildEmbeddedRunPayloads(params: {
     // lane is restored; its reasoning was emitted at its own message_end.
     const assistantForPayload = keptAnswer?.assistant ?? terminalAssistant;
     const assistantMessageIndex = keptAnswer?.messageIndex ?? terminalMessageIndex;
-    const answerSource = keptAnswer
-      ? keptAnswer.assistantTranscriptSource
-      : assistantTranscriptSource;
     // Pre-upgrade recovered messages have no stored facts, and recovery intentionally does not
     // reparse text; one in-flight reply can lose delivery or speech intent across this boundary.
     const storedDelivery = assistantForPayload?.openclawDelivery;
@@ -462,17 +429,16 @@ export function buildEmbeddedRunPayloads(params: {
             : {}),
         };
         addReplyPayloadMediaFailures(replyPayload, mediaFailures);
-        if (assistantMessageIndex !== undefined) {
-          setReplyPayloadMetadata(replyPayload, { assistantMessageIndex });
-        }
-        // A fallback can combine text from several physical responses. Without
-        // per-text custody, the latest answer's receipt must not own all of them.
-        if (answerSource && answerDirectives.length === 1) {
-          setReplyPayloadMetadata(replyPayload, {
-            assistantTranscriptSource: answerSource,
-            ...(shouldUseCanonicalFinalAnswer ? { assistantTranscriptAggregate: true } : {}),
-          });
-        }
+        const assistantTranscriptSource = readAgentAssistantSource(assistantForPayload);
+        setReplyPayloadMetadata(replyPayload, {
+          ...(assistantMessageIndex !== undefined ? { assistantMessageIndex } : {}),
+          ...(assistantTranscriptSource
+            ? {
+                assistantTranscriptSource,
+                ...(shouldUseCanonicalFinalAnswer ? { assistantTranscriptAggregate: true } : {}),
+              }
+            : {}),
+        });
         replyItems.push(
           ttsFacts ? setReplyPayloadMetadata(replyPayload, { tts: ttsFacts }) : replyPayload,
         );
@@ -488,7 +454,6 @@ export function buildEmbeddedRunPayloads(params: {
       lastAssistant: segment.lastAssistant,
       currentAssistant: segment.lastAssistant,
       assistantMessageIndex: segment.messageEnd,
-      assistantTranscriptSource: segment.assistantTranscriptSource,
       keptAnswer: segment.keptAnswer,
       sourceReplyDeliveryState: segment.sourceReplyDeliveryState,
     });
@@ -511,7 +476,6 @@ export function buildEmbeddedRunPayloads(params: {
     (!params.isCronTrigger ||
       (hasVisibleCommittedMessagingToolDeliveryEvidence(params) &&
         hasCompletedMessagingToolDeliveryEvidence(params))) &&
-    !params.isHeartbeatTrigger &&
     !params.runAborted;
   if (params.lastToolError && !respectIntentionalSilence && !sourceReplyPending) {
     // A restart intentionally aborts the active tool while the Gateway takes over.
@@ -547,9 +511,6 @@ export function buildEmbeddedRunPayloads(params: {
       }
     }
   }
-  if (heartbeatTerminalToolFailure && !replyItems.some((item) => item.isReasoning !== true)) {
-    replyItems.push({ text: HEARTBEAT_TOKEN });
-  }
   const hasAudioAsVoiceTag = replyItems.some((item) => item.audioAsVoice);
   return replyItems
     .map((item) => {
@@ -565,11 +526,6 @@ export function buildEmbeddedRunPayloads(params: {
         !suppressFailureArtifacts
       ) {
         markReplyPayloadForSourceSuppressionDelivery(payload);
-      }
-      if (heartbeatTerminalToolFailure) {
-        setReplyPayloadMetadata(payload, {
-          heartbeatTerminalToolFailure,
-        });
       }
       if (
         !item.isError &&

@@ -10,7 +10,6 @@ import { createFixtureLifetime } from "../../../test/helpers/fixture-lifetime.js
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { createEmbeddedAttemptTranscriptLifecycle } from "../../agents/embedded-agent-runner/run/attempt-transcript-lifecycle.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
-import type { AssistantTranscriptSource } from "../../agents/sessions/assistant-transcript-source.js";
 import { buildAssistantMessage, buildUsageWithNoCost } from "../../agents/stream-message-shared.js";
 import { setReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
@@ -30,6 +29,7 @@ import {
   withOwnedSessionTranscriptWrites,
 } from "../../config/sessions/transcript-write-context.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
+import type { AgentAssistantSourceReceipt } from "../../infra/agent-events.types.js";
 import { SqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
 import * as mediaFetch from "../../media/fetch.js";
 import {
@@ -178,9 +178,9 @@ it.for([
         ? [mediaUrl, `${mediaUrl}/second`]
         : [mediaUrl];
     const mixed = scenario === "mixed-text" || scenario === "mixed-media";
-    const assistantTranscriptSource: {
-      -readonly [Key in keyof AssistantTranscriptSource]: AssistantTranscriptSource[Key];
-    } = { occurrenceId: "progress-assistant-occurrence" };
+    const assistantTranscriptSource: AgentAssistantSourceReceipt = {
+      itemId: "progress-assistant-occurrence",
+    };
     const finalMediaUrl = scenario === "mixed-media" ? `${mediaUrl}/final` : undefined;
     const authoredUrls = [...mediaUrls, ...(finalMediaUrl ? [finalMediaUrl] : [])];
     const finalText = "Final result";
@@ -208,14 +208,15 @@ it.for([
       storePath: (await loadSessionEntryAsync("agent:main:commentary", { agentId: "main" }))
         .storePath,
     };
-    await replaceSessionEntry(scope, {
+    const sessionEntry = {
       sessionId: scope.sessionId,
       lifecycleRevision: "initial",
       updatedAt: 1,
       ...(localMedia
         ? { spawnedCwd: worktree, spawnedBy: "agent:main:main", sessionRoot: worktree }
         : {}),
-    });
+    };
+    await replaceSessionEntry(scope, sessionEntry);
     const readManaged = () => listManagedImageRecordEntries({ sessionKey: scope.sessionKey });
     // Prepare the shared media store before the download-sequencing checks.
     expect(await readManaged()).toEqual([]);
@@ -255,6 +256,7 @@ it.for([
       session: {
         ...scope,
         backingSessionId: scope.sessionId,
+        entry: sessionEntry,
         cfg,
         clientRunId: runId,
         sessionLoadOptions: { agentId: "main" },
@@ -396,7 +398,7 @@ it.for([
         if (!appended.ok || !appended.value) {
           throw new Error("Expected committed commentary message");
         }
-        assistantTranscriptSource.messageId = appended.value.messageId;
+        assistantTranscriptSource.committedMessageId = appended.value.messageId;
         await publishTranscriptUpdate(scope, { message, messageId: "progress-row", runId });
         if (scenario === "cache-miss") {
           return;
@@ -412,12 +414,16 @@ it.for([
         if (gcDuringPreparation) {
           // The second download holds the rewrite while the first original is on disk.
           expect(readMessage()).not.toHaveProperty("openclawDisplayContent");
-          expect(await readManaged()).toHaveLength(1);
-          expect(await cleanupManagedOutgoingMediaRecords()).toEqual({
-            deletedRecordCount: 0,
-            deletedFileCount: 0,
-            retainedCount: 1,
-          });
+          const preparedEntries = await readManaged();
+          expect(preparedEntries).toHaveLength(1);
+          await cleanupManagedOutgoingMediaRecords();
+          expect(await readManaged()).toEqual(preparedEntries);
+          for (const { record } of preparedEntries) {
+            const { mediaRoot, mediaSubdir, mediaId } = record.original;
+            expect(await fs.readFile(path.join(mediaRoot, mediaSubdir, mediaId))).toEqual(
+              PNG_BYTES,
+            );
+          }
         }
         if (aborted) {
           current = false;
@@ -565,11 +571,9 @@ it.for([
       await run;
       if (gcDuringPreparation) {
         // Committed originals must outlive transient retention even after the run ends.
-        expect(
-          await cleanupManagedOutgoingMediaRecords({
-            nowMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
-          }),
-        ).toEqual({ deletedRecordCount: 0, deletedFileCount: 0, retainedCount: 2 });
+        await cleanupManagedOutgoingMediaRecords({
+          nowMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
+        });
         const entries = await readManaged();
         expect(entries).toHaveLength(2);
         for (const { record } of entries) {
