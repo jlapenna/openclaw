@@ -68,6 +68,10 @@ done
 curl -fsS http://127.0.0.1:18801/health > /dev/null
 printf 'PROOF model=Qwen3-1.7B-Q8_0 revision=90862c4b9d2787eaed51d12237eafdfe7c5f6077 server=b11803 ready=true\n'
 cd "$task_root/source"
+# Use the supported offline writer for a shared, dummy local inference account.
+# Cron requires durable account ownership even for an unauthenticated local model.
+printf '%s\n' public-local-model-no-secret | \
+  pnpm openclaw models auth paste-api-key --provider proof --agent parent
 pnpm openclaw gateway run --port 18791 --allow-unconfigured > "$task_root/gateway.log" 2>&1 &
 task_gateway_pid=$!
 for task_try in {1..120}; do

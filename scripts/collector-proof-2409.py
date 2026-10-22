@@ -71,7 +71,8 @@ def run():
     )
     added = cli("cron", "add", "--name", "temporary-collector-proof-2409",
                 "--agent", "parent", "--session", "isolated", "--at", "1h",
-                "--message", task, "--thinking", "off", "--light-context",
+                "--message", task, "--model", "proof/proof-cpu@proof:manual",
+                "--thinking", "off", "--light-context",
                 "--tools", "sessions_spawn,agents_wait,write", "--timeout-seconds", "480",
                 "--announce", "--channel", "last", "--to", "isolated-proof-target", "--json")
     job_id = added.get("id") or added.get("job", {}).get("id")
