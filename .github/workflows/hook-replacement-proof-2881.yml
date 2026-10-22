@@ -1,0 +1,78 @@
+name: Temporary scheduled hook replacement proof
+
+on:
+  push:
+    branches: [proof/2881-hook-replacement-01a15ec0]
+    paths:
+      - .github/workflows/hook-replacement-proof-2881.yml
+      - scripts/hook-replacement-proof-2881.sh
+      - scripts/hook-replacement-proof-2881.py
+      - scripts/hook-replacement-proof-2881.mjs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hook-replacement-proof-2881
+  cancel-in-progress: true
+
+jobs:
+  runtime-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Run secretless proof within one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public standard runner: 4 CPUs, 16 GB RAM, 14 GB free storage.
+          # Envelope: 3 CPUs, 10 GiB RAM, 12 GB work volume; no accelerator.
+          # Reserve one CPU, 3 GB RAM and 2 GB storage on the same runner.
+          test "$(nproc)" -ge 4
+          test "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -ge 15000000
+          test "$(df --output=avail -B1 "$RUNNER_TEMP" | tail -1)" -ge 14000000000
+          task_proof_root=/mnt/hook-replacement-proof-2881
+          sudo truncate -s 12000000000 "$RUNNER_TEMP/hook-proof.img"
+          # Host reserves stay outside this private data volume.
+          sudo mkfs.ext4 -q -m 0 "$RUNNER_TEMP/hook-proof.img"
+          sudo mkdir -p "$task_proof_root"
+          sudo mount -o loop "$RUNNER_TEMP/hook-proof.img" "$task_proof_root"
+          sudo cp scripts/hook-replacement-proof-2881.{sh,py,mjs} "$task_proof_root/"
+          sudo chown -R nobody:nogroup "$task_proof_root"
+          wc -c "$task_proof_root"/hook-replacement-proof-2881.{sh,py,mjs}
+          sudo -u nobody test -s "$task_proof_root/hook-replacement-proof-2881.sh"
+          trap 'docker stop --time 10 hook-proof-runtime 2>/dev/null || true; docker rm hook-proof-tools 2>/dev/null || true; sudo umount /mnt/hook-replacement-proof-2881 || true' EXIT
+          task_node_image=node:24-trixie-slim@sha256:e79437bb05061f860be420634f676f4394619028df216d4b9361966d7fcc7a14
+          docker pull "$task_node_image"
+          # Toolchain preparation is separate from the larger runtime envelope.
+          docker run --name hook-proof-tools --cpus 1 --memory 1g --memory-swap 1g \
+            --pids-limit 256 "$task_node_image" bash -euc \
+            'apt-get update -qq; apt-get install -y --no-install-recommends ca-certificates curl git python3 zstd libgomp1; rm -rf /var/lib/apt/lists/*'
+          docker commit hook-proof-tools hook-proof-runtime:local
+          docker rm hook-proof-tools
+          task_checkout_bytes=$(du -sb "$GITHUB_WORKSPACE" | cut -f1)
+          task_base_bytes=$(docker image inspect "$task_node_image" --format '{{.Size}}')
+          task_runtime_bytes=$(docker image inspect hook-proof-runtime:local --format '{{.Size}}')
+          # Double-count shared image layers conservatively; retain 512 MiB for logs/temp.
+          test "$((task_checkout_bytes + task_base_bytes + task_runtime_bytes + 536870912))" -le 2000000000
+          timeout --signal=TERM --kill-after=15s 17m docker run --rm --name hook-proof-runtime \
+            --init --read-only --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+            --cpus 3 --memory 10g --memory-swap 10g --pids-limit 512 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m --volume "$task_proof_root:/proof:rw" \
+            --workdir /proof --env HOME=/proof/home --env CI=1 \
+            hook-proof-runtime:local /bin/bash /proof/hook-replacement-proof-2881.sh
+          python3 - "$task_proof_root/result.json" <<'PY'
+          import json,sys
+          with open(sys.argv[1]) as f:
+              proof=json.load(f)
+          assert proof['before_status']==proof['after_status']=='ok'
+          assert proof['before_build']=='A' and proof['after_build']=='B'
+          assert proof['old_instance_disposed'] and proof['same_gateway_process']
+          assert proof['old_instance_absent_after_reload'] is True
+          assert proof['restart_required'] is False and proof['job_removed'] is True
+          print('PROOF_VERIFIED '+json.dumps(proof))
+          PY
