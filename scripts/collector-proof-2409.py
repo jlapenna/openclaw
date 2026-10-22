@@ -13,7 +13,8 @@ MARKER = "COLLECTOR_PROOF_2409_COMPLETE"
 
 def cli(*args, check=True):
     result = subprocess.run(
-        ["pnpm", "openclaw", *args], cwd=ROOT / "source",
+        ["bash", "-c", 'exec pnpm openclaw "$@"', "collector-proof-cli", *args],
+        cwd=ROOT / "source",
         text=True, capture_output=True, timeout=600,
     )
     text = result.stdout
