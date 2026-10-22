@@ -2,7 +2,7 @@ name: Temporary collected-cron runtime proof
 
 on:
   push:
-    branches: [proof/2409-silent-collector-01a15ec0]
+    branches: [proof/2409-rebased-01a15ec0]
     paths:
       - .github/workflows/collector-proof-2409.yml
       - scripts/collector-proof-2409.sh

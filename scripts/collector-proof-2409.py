@@ -134,7 +134,7 @@ def run():
                     pending = value["pending"]
             except (ValueError, KeyError, TypeError):
                 continue
-    proof = {"source": "eeb921936223874e20c3c5a2c0cd6104373e92fe",
+    proof = {"source": "a725a65fa2f4f95477df79dbf571e07ad0bf42db",
              "accepted_collectors": len(accepted), "collected_successfully": len(completed),
              "spawn_shapes": spawns,
              "pending": pending, "final": finals[-1] if finals else None,
