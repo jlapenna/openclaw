@@ -21,25 +21,19 @@ npm install --prefix "$task_root/toolchain" --ignore-scripts --no-audit --no-fun
 export PATH="$task_root/toolchain/node_modules/.bin:$PATH"
 cd source
 pnpm install --frozen-lockfile --store-dir "$task_root/pnpm-store"
-# Use the owner's self-contained package path, then retire the build workspace.
-# Build dependencies and model weights must not occupy the work volume together.
-node scripts/package-openclaw-for-docker.mjs --output-dir "$task_root/package" \
-  --output-name openclaw-proof.tgz --allow-unreleased-changelog
-cd "$task_root"
-test -s "$task_root/package/openclaw-proof.tgz"
-sha256sum "$task_root/package/openclaw-proof.tgz"
-test "$(git -C "$task_root/source" rev-parse HEAD)" = "$task_head"
-rm -rf -- "$task_root/source" "$task_root/pnpm-store" "$task_root/npm-cache"
-npm install --prefix "$task_root/runtime" --omit=dev --no-audit --no-fund \
-  "$task_root/package/openclaw-proof.tgz"
-export OPENCLAW_PROOF_CLI="$task_root/runtime/node_modules/.bin/openclaw"
-"$OPENCLAW_PROOF_CLI" --version
+# The supported source CLI builds the real Gateway without an unrelated
+# publishable-package declaration-generation lane.
+pnpm openclaw --version
 
 cd "$task_root"
 curl -fsSL -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b11803/llama-b11803-bin-ubuntu-x64.tar.gz
 echo '2c718373086c9eda54d1e994cd5197aa079a4247e3dc4ec9edee8254cee08746  llama.tar.gz' | sha256sum -c -
 mkdir llama
 tar -xzf llama.tar.gz -C llama
+# Admit model bytes plus 512 MiB runtime growth before producing them.
+task_free_bytes=$(df --output=avail -B1 "$task_root" | tail -1 | tr -d ' ')
+test "$task_free_bytes" -ge "$((1834426016 + 536870912))"
+printf 'PROOF storage_available=%s model_bytes=1834426016 runtime_growth_reserve=536870912\n' "$task_free_bytes"
 curl -fsSL -o model.gguf https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf
 echo '061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a  model.gguf' | sha256sum -c -
 task_server=$(find "$task_root/llama" -type f -name llama-server -print -quit)
@@ -73,13 +67,13 @@ for task_try in {1..90}; do
 done
 curl -fsS http://127.0.0.1:18801/health > /dev/null
 printf 'PROOF model=Qwen3-1.7B-Q8_0 revision=90862c4b9d2787eaed51d12237eafdfe7c5f6077 server=b11803 ready=true\n'
-cd "$task_root"
-"$OPENCLAW_PROOF_CLI" gateway run --port 18791 --allow-unconfigured > "$task_root/gateway.log" 2>&1 &
+cd "$task_root/source"
+pnpm openclaw gateway run --port 18791 --allow-unconfigured > "$task_root/gateway.log" 2>&1 &
 task_gateway_pid=$!
 for task_try in {1..120}; do
-  if "$OPENCLAW_PROOF_CLI" gateway call health --json > "$task_root/health.json" 2> /dev/null; then break; fi
+  if pnpm openclaw gateway call health --json > "$task_root/health.json" 2> /dev/null; then break; fi
   kill -0 "$task_gateway_pid"
   sleep 2
 done
-"$OPENCLAW_PROOF_CLI" gateway call health --json > "$task_root/health.json"
+pnpm openclaw gateway call health --json > "$task_root/health.json"
 python3 "$task_root/collector-proof-2409.py" run
