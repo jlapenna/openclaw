@@ -33,8 +33,7 @@ import {
   buildCommandPaletteSessionItems,
   SESSION_SEARCH_LIMIT,
 } from "./command-palette-session-search.ts";
-import type { CommandPaletteProps, PaletteFilter } from "./command-palette-view.tsx";
-import type { OpenClawModalDialog } from "./modal-dialog.ts";
+import type { OpenClawModalDialog } from "./modal-dialog.tsx";
 
 const SEARCH_DEBOUNCE_MS = 200;
 const SESSION_SEARCH_MIN_CHARS = 2;
@@ -50,6 +49,8 @@ const SESSION_SEARCH_SCOPE = {
   excludeDock: true,
 } as const;
 const CATALOG_CACHE_TTL_MS = 30_000;
+
+export type PaletteFilter = "all" | "sessions" | "messages";
 
 export type CommandPaletteProperties = {
   onNavigate?: ApplicationContext["navigate"];
@@ -90,8 +91,7 @@ export class CommandPaletteState {
       this.changed();
     },
   });
-  private initialInput: CommandPaletteOpenInput | undefined;
-  private takeInitialInput: CommandPaletteInputHandoff | undefined;
+  private initialInput: CommandPaletteOpenInput | CommandPaletteInputHandoff | undefined;
   private inputElement: HTMLTextAreaElement | undefined;
   private stopInputFocus: (() => void) | undefined;
   private readonly mentionMenu = createHumanMentionMenu((nextOpen) =>
@@ -126,7 +126,7 @@ export class CommandPaletteState {
   private activeId: string | null = null;
   private sessionItems: readonly CommandPaletteItem[] = [];
   private catalogItems: readonly CommandPaletteItem[] = [];
-  private sessionSearchPending = false;
+  private sessionSearchRead: { promise: Promise<void> } | undefined;
   private sessionSearchFailed = false;
   private sessionSearchPartial = false;
   private archivedTranscriptsExcluded = 0;
@@ -141,15 +141,21 @@ export class CommandPaletteState {
     loadedAt?: number;
   };
   private modelItems: readonly CommandPaletteItem[] = [];
-  private readonly modelReader = new ModelCatalogReader(() => {
-    const snapshot = this.modelReader.snapshot;
-    if (snapshot.hasSnapshot) {
-      this.settledModels = snapshot;
-      // Project accepted catalog publications, not every rendering/selection read.
-      this.modelItems = getCommandPaletteModelItems(snapshot);
-    }
-    this.changed();
-  });
+  private modelSearchRead: { promise: Promise<unknown> } | undefined;
+  private readonly modelReader = new ModelCatalogReader(
+    () => {
+      const snapshot = this.modelReader.snapshot;
+      if (snapshot.hasSnapshot) {
+        this.settledModels = snapshot;
+        // Project accepted catalog publications, not every rendering/selection read.
+        this.modelItems = getCommandPaletteModelItems(snapshot);
+      }
+      this.changed();
+    },
+    {
+      onRead: (read) => (this.modelSearchRead = { promise: read.catch(() => undefined) }),
+    },
+  );
   private settledModels = this.modelReader.snapshot;
   private readonly gateway: GatewayPageBinding;
 
@@ -187,9 +193,10 @@ export class CommandPaletteState {
       getGateway: () => this.context?.gateway,
       invalidateRequests: (change) => {
         this.invalidateSessionSearch();
-        this.sessionSearchPending = false;
+        this.sessionSearchRead = undefined;
         this.catalogLoad = undefined;
         this.modelReader.clear();
+        this.modelSearchRead = undefined;
         if (change.identityChanged) {
           this.clearSessionSearch();
           this.clearCatalogSearch();
@@ -238,7 +245,6 @@ export class CommandPaletteState {
   disconnect() {
     this.connected = false;
     this.initialInput = undefined;
-    this.takeInitialInput = undefined;
     this.stopInputFocus?.();
     this.stopInputFocus = undefined;
     this.inputElement = undefined;
@@ -266,18 +272,14 @@ export class CommandPaletteState {
     this.onDraftInitialized();
     this.composing = false;
     this.mentionInput = undefined;
-    this.takeInitialInput = typeof input === "function" ? input : undefined;
-    this.initialInput =
-      typeof input === "function"
-        ? undefined
-        : (input ?? {
-            value: this.draft.message,
-            selectionStart: this.draft.message.length,
-            selectionEnd: this.draft.message.length,
-            selectionDirection: "none",
-            returnFocus,
-          });
-    if (this.initialInput) {
+    this.initialInput = input ?? {
+      value: this.draft.message,
+      selectionStart: this.draft.message.length,
+      selectionEnd: this.draft.message.length,
+      selectionDirection: "none",
+      returnFocus,
+    };
+    if (typeof this.initialInput !== "function") {
       this.draft.setMessage(this.initialInput.value);
     }
     this.activeId = null;
@@ -310,13 +312,11 @@ export class CommandPaletteState {
   }
 
   readonly togglePalette = () => {
-    if (this.open) {
-      if (!this.draft.submitting) {
-        this.closePalette();
-      }
-      return;
+    if (!this.open) {
+      this.openPalette();
+    } else if (!this.draft.submitting) {
+      this.closePalette();
     }
-    this.openPalette();
   };
 
   private closePalette() {
@@ -324,7 +324,6 @@ export class CommandPaletteState {
     this.composing = false;
     this.mentionInput = undefined;
     this.initialInput = undefined;
-    this.takeInitialInput = undefined;
     this.open = false;
     this.draft.close();
     this.clearSessionSearch();
@@ -352,9 +351,9 @@ export class CommandPaletteState {
     if (!this.open || !element?.isConnected || document.activeElement !== element) {
       return;
     }
-    if (this.takeInitialInput) {
-      const take = this.takeInitialInput;
-      this.takeInitialInput = undefined;
+    if (typeof this.initialInput === "function") {
+      const take = this.initialInput;
+      this.initialInput = undefined;
       const input = take();
       if (!input) {
         this.closePalette();
@@ -405,7 +404,7 @@ export class CommandPaletteState {
   private clearSessionSearch() {
     this.invalidateSessionSearch();
     this.sessionItems = [];
-    this.sessionSearchPending = false;
+    this.sessionSearchRead = undefined;
     this.sessionSearchFailed = false;
     this.sessionSearchPartial = false;
     this.archivedTranscriptsExcluded = 0;
@@ -414,6 +413,7 @@ export class CommandPaletteState {
 
   private clearCatalogSearch() {
     this.modelReader.clear();
+    this.modelSearchRead = undefined;
     this.modelItems = [];
     this.settledModels = this.modelReader.snapshot;
     this.catalogLoad = undefined;
@@ -476,7 +476,7 @@ export class CommandPaletteState {
             this.pluginIcons.load(pluginId);
           }
         }
-        this.catalogLoad = { ...this.catalogLoad, loadedAt: Date.now() };
+        this.catalogLoad.loadedAt = Date.now();
         this.changed();
       }
     });
@@ -518,14 +518,10 @@ export class CommandPaletteState {
       if (search.length < SESSION_SEARCH_MIN_CHARS) {
         return;
       }
-      this.sessionSearchPending = Boolean(
-        this.props.onSelectSession && this.context?.sessions && this.gateway.connected,
-      );
       void this.ensureCatalogItems();
       if (this.props.onSelectSession) {
-        void this.searchSessions(search);
-      } else {
-        this.sessionSearchPending = false;
+        this.sessionSearchRead = { promise: this.searchSessions(search) };
+        this.changed();
       }
     };
     if (immediate) {
@@ -539,7 +535,6 @@ export class CommandPaletteState {
     const { sessions, gateway } = this.context;
     const client = gateway.snapshot.client;
     if (!sessions || gateway?.snapshot.phase !== "connected" || !client) {
-      this.sessionSearchPending = false;
       return;
     }
     const requestId = ++this.sessionSearchId;
@@ -595,7 +590,6 @@ export class CommandPaletteState {
       }
     } finally {
       if (isCurrent()) {
-        this.sessionSearchPending = false;
         this.changed();
       }
     }
@@ -644,9 +638,10 @@ export class CommandPaletteState {
     );
   }
 
-  readProps(): CommandPaletteProps {
+  readProps() {
     const models = this.settledModels;
     return {
+      ...this.props,
       basePath: this.context?.basePath ?? "",
       open: this.open,
       query: this.draft.message,
@@ -658,7 +653,7 @@ export class CommandPaletteState {
       mentionHost: this.mentionHost,
       onMentionChange: this.notifyMentionChange,
       composing: this.composing,
-      onBeforeInput: (event) => {
+      onBeforeInput: (event: InputEvent) => {
         const input = this.inputElement;
         this.mentionInput = input
           ? {
@@ -687,7 +682,7 @@ export class CommandPaletteState {
       },
       activeId: this.activeId,
       filter: this.filter,
-      onFilterChange: (filter) => {
+      onFilterChange: (filter: PaletteFilter) => {
         this.filter = filter;
         this.activeId = null;
         this.changed();
@@ -711,20 +706,18 @@ export class CommandPaletteState {
         ...this.catalogItems,
         ...this.modelItems,
       ],
-      sessionSearchPending: this.sessionSearchPending,
-      catalogSearchPending: Boolean(
-        normalizeOptionalString(this.searchQuery) &&
-        !this.promptMode &&
-        ((this.catalogLoad && this.catalogLoad.loadedAt === undefined) || this.modelReader.pending),
-      ),
+      sessionSearchRead: this.sessionSearchRead,
+      catalogSearchRead: this.catalogLoad,
+      modelSearchRead: this.modelSearchRead,
+      catalogSearchPending:
+        Boolean(this.catalogLoad && this.catalogLoad.loadedAt === undefined) ||
+        this.modelReader.pending,
       sessionSearchFailed: this.sessionSearchFailed,
       sessionSearchPartial: this.sessionSearchPartial,
       sessionSearchIndexing: this.sessionSearchIndexing,
       archivedTranscriptsExcluded: this.archivedTranscriptsExcluded,
-      desktopAvailable: this.props.desktopAvailable,
-      custodianAvailable: this.props.custodianAvailable,
       onToggle: this.togglePalette,
-      onQueryChange: (query, event) => {
+      onQueryChange: (query: string, event: InputEvent) => {
         this.draft.setMessage(
           query,
           updateHumanMentions(this.draft.message, query, this.draft.mentions, this.mentionInput),
@@ -732,16 +725,13 @@ export class CommandPaletteState {
         this.mentionInput = undefined;
         this.updateMentionMenu(event);
       },
-      onActiveIdChange: (id) => {
+      onActiveIdChange: (id: string) => {
         this.activeId = id;
         this.changed();
       },
-      onNavigate: this.props.onNavigate,
-      onSelectSession: this.props.onSelectSession,
-      onSlashCommand: this.props.onSlashCommand,
       pluginIconUrls: this.pluginIconUrls,
-      onPluginIconError: (pluginId) => this.pluginIcons.handleError(pluginId),
-      registerPluginIcon: (readId) => {
+      onPluginIconError: (pluginId: string) => this.pluginIcons.handleError(pluginId),
+      registerPluginIcon: (readId: () => string) => {
         this.pluginIconTiles.add(readId);
         const pluginId = readId();
         if (this.catalogItems.some((item) => item.pluginId === pluginId && item.hasPluginIcon)) {

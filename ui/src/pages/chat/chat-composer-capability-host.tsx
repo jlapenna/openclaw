@@ -1,12 +1,13 @@
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
-import { createMemo, lazy, Loading, Show } from "solid-js";
+import { createMemo, lazy, Show } from "solid-js";
+import { createChangeListeners } from "../../../../src/shared/listeners.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ConfigSnapshot, GatewaySessionRow, ToolsEffectiveResult } from "../../api/types.ts";
 import type { ApplicationContext } from "../../app/context.ts";
 import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
 import type { McpServerForm } from "../../components/mcp-server-form.ts";
-import "../../components/modal-dialog.ts";
 import { LoadingState } from "../../components/solid/loading-state.tsx";
+import "../../components/modal-dialog.tsx";
 import { registerMcpEnglish } from "../../i18n/locales/en-mcp.ts";
 import { buildToolsEffectiveRequestKey } from "../../lib/agents/tools-effective.ts";
 import { currentDisplayRuntimeConfig } from "../../lib/config/config-state-model.ts";
@@ -32,6 +33,7 @@ import { refreshCurrentChatSessionList } from "./chat-session.ts";
 import { patchChatSessionSettings } from "./chat-settings-patches.ts";
 import type { ChatPageHost } from "./chat-state-host.ts";
 import type { ChatComposerCapabilityMenuProps } from "./components/chat-composer-plus-menu.types.ts";
+import { ChatLazyBoundary } from "./components/chat-lazy-boundary.tsx";
 import {
   ComposerSkillCatalog,
   composerWebSearchBaseEnabled,
@@ -67,7 +69,7 @@ function activeConfigFingerprint(
 }
 
 export class ChatComposerCapabilityHost {
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = createChangeListeners();
   private readonly skillCatalog = new ComposerSkillCatalog(() => this.publish());
   private readonly library = new ComposerLibrarySession(() => this.publish());
   private readonly patchTokens = new Map<string, symbol>();
@@ -81,16 +83,8 @@ export class ChatComposerCapabilityHost {
   private addBusy = false;
   private addError: string | null = null;
 
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  private publish(): void {
-    for (const listener of this.listeners) {
-      listener();
-    }
-  }
+  readonly subscribe = this.listeners.subscribe;
+  private readonly publish = this.listeners.publish;
 
   private effectiveToolsKeys(
     context: ApplicationContext,
@@ -236,15 +230,6 @@ export class ChatComposerCapabilityHost {
     }
   }
 
-  private closeAddDialog(): void {
-    if (this.addBusy) {
-      return;
-    }
-    this.addDialogOpen = false;
-    this.addError = null;
-    this.publish();
-  }
-
   private addServerBlockedReason(
     context: ApplicationContext,
     state: ChatPageHost,
@@ -334,7 +319,7 @@ export class ChatComposerCapabilityHost {
     try {
       await patchMcpServers(context.runtimeConfig, {
         buildPatch: (servers) => buildAddMcpServerPatch(servers, name, globalConfig),
-        note: `composer connectors: add MCP server ${name}`,
+        note: `composer plugins: add MCP server ${name}`,
       });
       if (scope === "session") {
         stage = "session";
@@ -369,12 +354,13 @@ export class ChatComposerCapabilityHost {
       error: this.addError,
       scopeBlockedReason: this.addServerBlockedReason(context, state, session, "everywhere"),
       submitBlockedReason: this.addServerBlockedReason(context, state, session, this.addScope),
-      onCancel: (event?: Event) => {
+      onCancel: () => {
         if (this.addBusy) {
-          event?.preventDefault();
           return;
         }
-        this.closeAddDialog();
+        this.addDialogOpen = false;
+        this.addError = null;
+        this.publish();
       },
       onScopeChange: (scope: ComposerMcpServerScope) => {
         this.addScope = scope;
@@ -482,8 +468,7 @@ export class ChatComposerCapabilityHost {
     return {
       basePath: state.basePath,
       skills: this.skillCatalog.rows(agentId, session?.toolOverrides),
-      skillsLoading: this.skillCatalog.isLoading(agentId),
-      skillsError: this.skillCatalog.hasError(agentId),
+      skillsRead: this.skillCatalog.read(agentId),
       mcpServers: summarizeMcpServers(runtimeConfig) ?? [],
       toolsEffectiveResult,
       toolsEffectiveLoading,
@@ -580,15 +565,15 @@ export function ChatComposerCapabilityDialogs(props: ChatComposerCapabilityDialo
   return (
     <>
       <Show when={view().open}>
-        <Loading fallback={<LoadingState />}>
+        <ChatLazyBoundary fallback={<LoadingState />} onClose={() => view().onCancel()}>
           <ComposerAddServerDialog {...view()} />
-        </Loading>
+        </ChatLazyBoundary>
       </Show>
       <Show when={view().library}>
         {(library) => (
-          <Loading fallback={<LoadingState />}>
+          <ChatLazyBoundary fallback={<LoadingState />} onClose={() => library().onClose()}>
             <LibraryPinRead {...library()} />
-          </Loading>
+          </ChatLazyBoundary>
         )}
       </Show>
     </>
