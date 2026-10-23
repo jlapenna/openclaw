@@ -61,8 +61,8 @@ describe("handleMessageEnd", () => {
       ctx.state.assistantMessageIndex = 4;
       const started = structuredClone(message);
       await handleEvent({ type: "message_start", message: started });
-      const source = expectDefined(readAgentAssistantSource(started));
-      const itemId = expectDefined(source.itemId);
+      const source = expectDefined(readAgentAssistantSource(started), "assistant source receipt");
+      const itemId = expectDefined(source.itemId, "assistant source occurrence ID");
       expect(itemId).not.toBe("");
       sourceIds.push(itemId);
       await handleEvent({ type: "message_end", message });
