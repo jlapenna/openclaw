@@ -17,7 +17,7 @@ import {
   categoryClearReturnsToGroups,
   type SidebarSessionsGrouping,
 } from "../lib/sessions/grouping.ts";
-import { isSessionDisplayMetadataPatch } from "../lib/sessions/patch.ts";
+import { isSessionDeferredPatch } from "../lib/sessions/patch.ts";
 import type { runSessionNavigationAction } from "../lib/sessions/session-menu-navigation.ts";
 import {
   loadStoredCollapsedSessionSections,
@@ -109,7 +109,7 @@ export class SessionOrganizer {
     patch: SidebarSessionPatch,
     options: { sessionScope?: boolean } = {},
   ): Promise<SidebarSessionMutationResult> => {
-    const scope = this.deps.sessionData.beginSessionMutation(isSessionDisplayMetadataPatch(patch));
+    const scope = this.deps.sessionData.beginSessionMutation(isSessionDeferredPatch(patch));
     if (!scope) {
       return "stale";
     }
@@ -161,35 +161,40 @@ export class SessionOrganizer {
           ? this.patchSession(session, { archived: false }, { sessionScope: true })
           : this.archiveSessionWithUndo(session);
       default:
-        return this.runOperation((operations, scope) => {
-          switch (action.kind) {
-            case "rename":
-              return operations.renameSession(this.deps, session, scope);
-            case "assign-owner":
-              return operations.assignSessionOwner(this.deps, session, action.owner, scope);
-            case "fork":
-              return operations.forkSession(this.deps, session, scope);
-            case "snooze":
-              return operations.snoozeSessionWithUndo(this.deps, session, action, scope);
-            case "stop-cloud-worker":
-              return operations.stopCloudWorker(this.deps, session, scope);
-            case "delete":
-              // Only the sidebar offers the delete-confirm opt-out.
-              return operations.deleteSession(this.deps, session, scope, { offerSkip: true });
-            default:
-              return action satisfies never;
-          }
-        }, action.kind === "rename");
+        return this.runOperation(
+          (operations, scope) => {
+            switch (action.kind) {
+              case "rename":
+                return operations.renameSession(this.deps, session, scope);
+              case "assign-owner":
+                return operations.assignSessionOwner(this.deps, session, action.owner, scope);
+              case "fork":
+                return operations.forkSession(this.deps, session, scope);
+              case "snooze":
+                return operations.snoozeSessionWithUndo(this.deps, session, action, scope);
+              case "stop-cloud-worker":
+                return operations.stopCloudWorker(this.deps, session, scope);
+              case "delete":
+                // Only the sidebar offers the delete-confirm opt-out.
+                return operations.deleteSession(this.deps, session, scope, { offerSkip: true });
+              default:
+                return action satisfies never;
+            }
+          },
+          action.kind === "rename" || action.kind === "delete",
+        );
     }
   }
 
   archiveSessionWithUndo(session: SidebarRecentSession): Promise<void> {
-    return this.runOperation((operations, scope) =>
-      operations.archiveSessionWithUndo(
-        this.deps,
-        { ...session, hasArchiveDescendants: sidebarSessionHasArchiveDescendants(session) },
-        scope,
-      ),
+    return this.runOperation(
+      (operations, scope) =>
+        operations.archiveSessionWithUndo(
+          this.deps,
+          { ...session, hasArchiveDescendants: sidebarSessionHasArchiveDescendants(session) },
+          scope,
+        ),
+      true,
     );
   }
 
@@ -208,8 +213,10 @@ export class SessionOrganizer {
       await this.createSessionGroup(rows);
       return;
     }
-    await this.runOperation((operations, scope) =>
-      operations.runBatchSessionAction(this.deps, action, rows, allUnread, scope),
+    await this.runOperation(
+      (operations, scope) =>
+        operations.runBatchSessionAction(this.deps, action, rows, allUnread, scope),
+      action.kind === "toggle-archived" || action.kind === "delete",
     );
   }
 
@@ -586,7 +593,12 @@ export class SessionOrganizer {
     );
   }
 
-  sectionDragOver(event: DragEvent, sectionId: string, category?: string) {
+  sectionDragOver(
+    event: DragEvent,
+    sectionId: string,
+    category?: string,
+    targetSessionKey?: string,
+  ) {
     const dataTransfer = event.dataTransfer;
     if (
       sidebarSectionDragActive(dataTransfer) &&
@@ -617,10 +629,20 @@ export class SessionOrganizer {
       event.stopPropagation();
       return;
     }
+    if (sectionId === "pinned" && targetSessionKey) {
+      this.sessionDropTarget = null;
+      this.sidebarSectionDropTarget = null;
+      this.handleSidebarZoneDragOver(
+        event,
+        serializeSidebarEntry({ type: "session", key: targetSessionKey }),
+      );
+      return;
+    }
     event.preventDefault();
     if (dataTransfer) {
       dataTransfer.dropEffect = "move";
     }
+    this.sidebarZoneDropTarget = null;
     this.sessionDropTarget = sectionId;
     this.sidebarSectionDropTarget = null;
     this.notify();
@@ -641,14 +663,19 @@ export class SessionOrganizer {
     }
   }
 
-  sectionDrop(event: DragEvent, sectionId: string, category?: string) {
+  sectionDrop(event: DragEvent, sectionId: string, category?: string, targetSessionKey?: string) {
     const sourceSectionId = readSidebarSectionDragData(event.dataTransfer);
     const sessionKey = readSessionDragData(event.dataTransfer);
     if ((!sourceSectionId && !sessionKey) || (sourceSectionId && sectionId === "pinned")) {
       return;
     }
-    // Rows can be dragged from a browsed agent section, so search all caches.
-    const session = sessionKey ? this.deps.findSidebarMenuSessionByKey(sessionKey) : undefined;
+    // Shared moves use loaded rows; personal pins can also resolve outside the roster.
+    const session = sessionKey
+      ? (this.deps.findSidebarMenuSessionByKey(sessionKey) ??
+        (sectionId === "pinned"
+          ? this.deps.reconciledSidebarZone().sessionRows.get(sessionKey)
+          : undefined))
+      : undefined;
     if (!sourceSectionId && !this.sectionAcceptsSession(sectionId, category, session)) {
       event.stopPropagation();
       return;
@@ -663,7 +690,20 @@ export class SessionOrganizer {
       void this.reorderSidebarSection(sourceSectionId, sectionId, position);
     } else if (session && sectionId === "pinned") {
       if (session.pinnable) {
-        this.setPersonalSessionPin(session.key, true);
+        if (targetSessionKey && targetSessionKey !== session.key) {
+          const targetEntry = serializeSidebarEntry({ type: "session", key: targetSessionKey });
+          const position =
+            this.sidebarZoneDropTarget?.entry === targetEntry
+              ? this.sidebarZoneDropTarget.position
+              : "before";
+          this.writeSidebarEntryAt(
+            serializeSidebarEntry({ type: "session", key: session.key }),
+            targetEntry,
+            position,
+          );
+        } else {
+          this.setPersonalSessionPin(session.key, true);
+        }
       }
     } else if (session) {
       const nextCategory = category ?? null;

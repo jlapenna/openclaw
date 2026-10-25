@@ -1,6 +1,7 @@
 import type { Locator, Page } from "playwright";
-import type { CronJob } from "../../ui/src/api/types.ts";
-import { pathForRoute } from "../../ui/src/app-route-paths.ts";
+import type { ConfigSchemaResponse, CronJob } from "../../ui/src/api/types.ts";
+import { pathForAgentPanel, pathForRoute } from "../../ui/src/app-route-paths.ts";
+import { createSkill } from "../../ui/src/pages/skills/view.test-support.ts";
 import type { MockGatewayControls } from "../../ui/src/test-helpers/control-ui-e2e-contract.ts";
 import {
   controlUiSessionPath,
@@ -9,17 +10,25 @@ import {
 } from "../../ui/src/test-helpers/control-ui-e2e.ts";
 import { navigationDrawerToggle } from "../../ui/src/test-helpers/control-ui-navigation.ts";
 import { cronListResponseFixture } from "../../ui/src/test-helpers/cron.ts";
+import { meetingStatus } from "../../ui/src/test-helpers/transcripts.test-support.ts";
 
 const sessionKeys = ["agent:main:interaction-a", "agent:main:interaction-b"] as const;
 const sessionQuery = "Interaction 0999";
 const modelQuery = "Warm model 0999";
 const cronQuery = "Warm automation 0499";
 const activePane = ".chat-pane-cache__pane--active";
+const sidebarClocks = ".sidebar-recent-session openclaw-elapsed-time";
+const initialClockLabels = new WeakMap<Page, string>();
+
+type InteractionFixtureOptions = { runningSessions?: boolean };
 
 export type InteractionScenario = {
   id: string;
   route: string;
   expected: string;
+  fixture?: InteractionFixtureOptions;
+  /** Count newly inserted rows across the action, including transient replacements. */
+  rowSelector?: string;
   prepare: (page: Page, gateway: MockGatewayControls) => Promise<void>;
   run: (page: Page, gateway: MockGatewayControls) => Promise<void>;
 };
@@ -27,24 +36,45 @@ export type InteractionScenario = {
 export function createInteractionFixture(
   buildId: string,
   version: string,
-): ControlUiMockGatewayScenario {
-  const sessions = Array.from({ length: 1_000 }, (_, index) => ({
-    key: sessionKeys[index] ?? `agent:main:interaction-${index}`,
-    sessionId: `interaction-session-${index}`,
-    kind: "direct" as const,
-    label: `Interaction ${String(index).padStart(4, "0")}`,
-    updatedAt: 1_800_000_000_000 - index * 1_000,
-    childOwnerSessionKeys: [],
+  options: InteractionFixtureOptions = {},
+) {
+  const captureSources = ["Alpha", "Beta"].map((title) => ({
+    providerId: "test-voice",
+    guildId: "guild",
+    channelId: title.toLowerCase(),
+    title,
   }));
-  const list = (rows: typeof sessions) => ({
-    ts: 1_800_000_000_000,
-    path: "",
-    count: rows.length,
-    totalCount: rows.length,
-    hasMore: false,
-    nextOffset: null,
-    defaults: { model: "model-0", modelProvider: "example", contextTokens: 128_000 },
-    sessions: rows,
+  const config = { transcripts: { enabled: true, autoStart: captureSources } };
+  const keyForIndex = (index: number) => sessionKeys[index] ?? `agent:main:interaction-${index}`;
+  const startedAt = options.runningSessions ? Date.now() - 5_000 : undefined;
+  const sessions = Array.from({ length: 1_000 }, (_, index) => {
+    const runningChild = options.runningSessions && index > 0 && index <= 200;
+    return {
+      key: keyForIndex(index),
+      sessionId: `interaction-session-${index}`,
+      agentId: "main",
+      kind: "direct" as const,
+      label: `Interaction ${String(index).padStart(4, "0")}`,
+      updatedAt: 1_800_000_000_000 - index * 1_000,
+      childOwnerSessionKeys: runningChild ? [sessionKeys[0]] : [],
+      ...(options.runningSessions && index === 0
+        ? {
+            childSessions: Array.from({ length: 200 }, (_childValue, child) =>
+              keyForIndex(child + 1),
+            ),
+          }
+        : {}),
+      ...(runningChild
+        ? {
+            startedAt,
+            hasActiveRun: true,
+            activeRunIds: [`interaction-run-${index}`],
+            status: "running" as const,
+            spawnedBy: sessionKeys[0],
+            parentSessionKey: sessionKeys[0],
+          }
+        : {}),
+    };
   });
   const jobs: CronJob[] = Array.from({ length: 500 }, (_, index) => ({
     id: `interaction-job-${index}`,
@@ -103,16 +133,76 @@ export function createInteractionFixture(
       contextWindow: 128_000,
     })),
     methodResponses: {
-      "sessions.list": {
-        cases: [
-          ...Array.from({ length: sessionQuery.length }, (_, index) => {
-            const search = sessionQuery.slice(0, index + 1);
-            return {
-              match: { search },
-              response: list(sessions.filter((row) => row.label.includes(search))),
-            };
+      "config.schema": {
+        schema: { type: "object", properties: {} },
+        uiHints: {},
+        version: "interaction-config",
+        generatedAt: "2026-10-23T00:00:00.000Z",
+      } satisfies ConfigSchemaResponse,
+      "progressCard.get": { card: null },
+      "config.get": {
+        config,
+        sourceConfig: config,
+        hash: "interaction-config",
+        raw: JSON.stringify(config),
+        valid: true,
+        issues: [],
+      },
+      "transcripts.status": {
+        ...meetingStatus,
+        configuredSources: captureSources.map((source) =>
+          Object.assign({}, meetingStatus.configuredSources[0], { source, title: source.title }),
+        ),
+      },
+      "skills.status": {
+        workspaceDir: "/synthetic/workspace",
+        managedSkillsDir: "/synthetic/skills",
+        skills: ["Alpha", "Beta"].map((name) =>
+          createSkill({
+            name,
+            skillKey: name.toLowerCase(),
+            primaryEnv: undefined,
+            missing: { bins: ["synthetic-bin"], anyBins: [], env: [], config: [], os: [] },
+            blockedByAgentFilter: true,
           }),
-          { response: list(sessions) },
+        ),
+      },
+      "sessions.storage.status": {
+        agents: ["main", "research"].map((agentId) => ({
+          agentId,
+          storePath: `/synthetic/${agentId}.sqlite`,
+          hotTranscripts: 7,
+          coldTranscripts: 0,
+          databaseBytes: 4096,
+          walBytes: 0,
+          archiveBytes: 0,
+          embeddedArchiveBytes: 0,
+        })),
+        maintenance: {
+          running: false,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastError: null,
+          archivedTranscripts: 0,
+          externalizedTranscripts: 0,
+        },
+      },
+      "models.authStatus": {
+        ts: 1_800_000_000_000,
+        providers: [{ provider: "openai", displayName: "OpenAI", status: "ok", profiles: [] }],
+      },
+      "usage.status": {
+        updatedAt: 1_800_000_000_000,
+        providers: [
+          {
+            provider: "openai",
+            displayName: "OpenAI",
+            windows: [
+              { label: "5h", usedPercent: 25 },
+              { label: "Weekly", usedPercent: 40 },
+            ],
+            billing: [{ type: "balance", amount: 12, unit: "credits" }],
+          },
         ],
       },
       "cron.list": cronListResponseFixture([
@@ -133,7 +223,7 @@ export function createInteractionFixture(
         nextOffset: null,
       },
     },
-  };
+  } satisfies ControlUiMockGatewayScenario;
 }
 
 async function frames(page: Page) {
@@ -274,6 +364,16 @@ async function prepareSessions(page: Page, gateway: MockGatewayControls) {
   await frames(page);
 }
 
+async function refreshSessions(page: Page, gateway: MockGatewayControls) {
+  const after = (await gateway.getRequests("sessions.list", { source: "sessions-page" })).length;
+  await page.locator(".sessions-toolbar__refresh").click();
+  await gateway.waitForRequest("sessions.list", { after, match: { source: "sessions-page" } });
+  await page.waitForFunction(
+    () => !document.querySelector<HTMLButtonElement>(".sessions-toolbar__refresh")?.disabled,
+  );
+  await frames(page);
+}
+
 async function prepareCron(page: Page) {
   await page.locator(".cron-table__row").first().waitFor();
   const more = page.getByRole("button", { name: "Load more", exact: true });
@@ -300,11 +400,193 @@ async function settingsSection(
   await waitForControlUiRoute(page, { routeId, pathname: path });
 }
 
+async function prepareModelPicker(page: Page) {
+  await prepareChat(page);
+  await page.locator(`${activePane} .agent-chat__input textarea`).first().click();
+  const trigger = page.locator(`${activePane} [data-chat-model-select]`);
+  await trigger.waitFor({ state: "visible" });
+  await trigger.click();
+  await page.locator("[data-chat-model-search]").waitFor();
+  await trigger.click();
+}
+
+async function searchModels(page: Page) {
+  await page.locator("[data-chat-model-search]").pressSequentially(modelQuery);
+  await page.locator('[data-chat-model-option="example/model-999"]').waitFor();
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll<HTMLElement>("[data-chat-model-option]")].filter((option) =>
+        option.checkVisibility(),
+      ).length === 1,
+  );
+}
+
 export const interactionScenarios: readonly InteractionScenario[] = [
+  {
+    id: "sidebar-clock-idle",
+    route: "/new",
+    fixture: { runningSessions: true },
+    expected: "At least 100 running child-session clocks advance during five idle seconds.",
+    rowSelector: sidebarClocks,
+    prepare: async (page) => {
+      await navigation(page, "sessions");
+      const toggle = page.locator(`[data-child-session-toggle="${sessionKeys[0]}"]`);
+      await toggle.waitFor();
+      if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+        await toggle.click();
+      }
+      await page.locator(sidebarClocks).first().waitFor({ state: "attached" });
+      const more = page.locator(`[data-show-more-children="${sessionKeys[0]}"]`);
+      if ((await page.locator(sidebarClocks).count()) < 100 && (await more.count()) > 0) {
+        await more.click();
+      }
+      await page.waitForFunction(
+        (selector) => document.querySelectorAll(selector).length >= 100,
+        sidebarClocks,
+      );
+      const viewport = page.viewportSize()!;
+      await page.mouse.move(viewport.width - 8, viewport.height - 8);
+      await page.locator('[role="tooltip"]:visible').first().waitFor({ state: "hidden" });
+      const label = await page.locator(sidebarClocks).first().textContent();
+      if (!label?.trim()) {
+        throw new Error("Running sidebar clocks must have an initial elapsed label");
+      }
+      initialClockLabels.set(page, label);
+    },
+    run: async (page) => {
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 5_000);
+          }),
+      );
+      const clocks = page.locator(sidebarClocks);
+      const label = await clocks.first().textContent();
+      if (
+        (await clocks.count()) < 100 ||
+        !label?.trim() ||
+        label === initialClockLabels.get(page)
+      ) {
+        throw new Error("At least 100 running sidebar clocks must remain mounted and advance");
+      }
+      initialClockLabels.delete(page);
+    },
+  },
+  {
+    id: "agent-skills-refresh",
+    route: pathForAgentPanel("main", "skills"),
+    expected: "Refreshing the agent's skills retains both rows and their diagnostics.",
+    rowSelector: ".agent-skill-row, .agent-skill-row .settings-row__desc",
+    prepare: async (page) => {
+      await page.locator(".agent-skill-row").first().waitFor();
+    },
+    run: async (page, gateway) => {
+      const after = (await gateway.getRequests("skills.status")).length;
+      const section = page.locator(".settings-section").filter({
+        has: page.locator('input[name="agent-skills-filter"]'),
+      });
+      await section.getByRole("button", { name: "Refresh", exact: true }).click();
+      await gateway.waitForRequest("skills.status", { after });
+      await frames(page);
+    },
+  },
+  {
+    id: "meeting-health-refresh",
+    route: `${pathForRoute("communications")}?section=transcripts#settings-communications-meeting-capture`,
+    expected: "Refreshing capture health retains source controls and health rows.",
+    rowSelector: "openclaw-meeting-capture-settings .settings-row",
+    prepare: async (page) => {
+      await page
+        .locator('openclaw-meeting-capture-settings [aria-label="Edit source 1"]')
+        .waitFor();
+      await page.getByText("Applied source state", { exact: true }).waitFor();
+    },
+    run: async (page, gateway) => {
+      const after = (await gateway.getRequests("transcripts.status")).length;
+      await page
+        .locator("openclaw-meeting-capture-settings")
+        .getByRole("button", { name: "Refresh", exact: true })
+        .click();
+      await gateway.waitForRequest("transcripts.status", { after });
+      await frames(page);
+    },
+  },
+  {
+    id: "cron-refresh",
+    route: pathForRoute("cron"),
+    expected: "Refreshing the first automation page retains unchanged job rows.",
+    rowSelector: ".cron-table__row",
+    prepare: async (page, gateway) => inventoryReady(page, gateway, "cron"),
+    run: async (page, gateway) => {
+      const after = (await gateway.getRequests("cron.list")).length;
+      await page.locator(".cron-refresh").click();
+      await gateway.waitForRequest("cron.list", { after });
+      await page.waitForFunction(
+        () => document.querySelector(".cron-table")?.getAttribute("aria-busy") !== "true",
+      );
+      await frames(page);
+    },
+  },
+  {
+    id: "provider-usage-refresh",
+    route: pathForRoute("model-providers"),
+    expected: "Refreshing provider usage retains the plan windows and billing rows.",
+    rowSelector:
+      ".provider-usage__group, .provider-usage__window, .provider-usage__row, .provider-usage__chip",
+    prepare: async (page) => {
+      const summary = page.locator('[data-provider-id="openai"] .provider-row__summary');
+      await summary.waitFor();
+      if ((await summary.getAttribute("aria-expanded")) !== "true") {
+        await summary.click();
+      }
+      await page.locator(".provider-usage__window").first().waitFor();
+    },
+    run: async (page, gateway) => {
+      const after = (await gateway.getRequests("usage.status")).length;
+      await page.getByRole("button", { name: "Refresh", exact: true }).click();
+      await gateway.waitForRequest("usage.status", { after });
+      await frames(page);
+    },
+  },
+  {
+    id: "storage-refresh",
+    route: `${pathForRoute("ai-agents")}?section=session#settings-session-storage`,
+    expected: "An unchanged storage refresh retains both agent rows and the open disclosure.",
+    rowSelector: "openclaw-session-storage-settings details > .settings-row",
+    prepare: async (page) => {
+      const details = page.locator(
+        "openclaw-session-storage-settings details.settings-row--stacked",
+      );
+      await details.locator("summary").click();
+      await details.getByText("research", { exact: true }).waitFor();
+    },
+    run: async (page, gateway) => {
+      const after = (await gateway.getRequests("sessions.storage.status")).length;
+      const section = page.locator("openclaw-session-storage-settings");
+      await section.getByRole("button", { name: "Refresh", exact: true }).click();
+      await gateway.waitForRequest("sessions.storage.status", { after });
+      await section.getByRole("button", { name: "Refresh", exact: true }).waitFor();
+      await frames(page);
+    },
+  },
+  {
+    id: "sessions-refresh",
+    route: pathForRoute("sessions"),
+    expected: "Refreshing retains all visible sessions and expanded detail statistics.",
+    rowSelector: ".sessions-table .session-data-row, .session-detail-stat",
+    prepare: async (page, gateway) => {
+      await prepareSessions(page, gateway);
+      await refreshSessions(page, gateway);
+      await page.locator(".session-details-toggle").first().click();
+      await page.locator(".session-detail-stat").first().waitFor();
+    },
+    run: refreshSessions,
+  },
   {
     id: "session-switch",
     route: controlUiSessionPath(sessionKeys[0]),
     expected: "Both retained 400-message transcripts become visible in turn.",
+    rowSelector: "[data-virtual-row-key], .sidebar-recent-session",
     prepare: prepareSessionSwitch,
     run: async (page) => {
       await switchSession(page, 1);
@@ -332,9 +614,20 @@ export const interactionScenarios: readonly InteractionScenario[] = [
     id: "sidebar-toggle",
     route: controlUiSessionPath(sessionKeys[0]),
     expected: "The 1,000-session sidebar closes and reopens.",
-    prepare: async (page) => {
+    prepare: async (page, gateway) => {
       await prepareChat(page);
       await navigation(page, "sessions");
+      const more = page.locator(
+        ".sidebar-session-pagination--roster > .sidebar-session-pagination__button",
+      );
+      for (const offset of [200, 400, 600, 800]) {
+        await more.click();
+        await gateway.waitForRequest("sessions.list", {
+          match: { source: "sidebar", offset, limit: 200 },
+        });
+        await frames(page);
+      }
+      await more.waitFor({ state: "hidden" });
     },
     run: async (page) => {
       if (await page.locator(".shell--mobile-nav").count()) {
@@ -375,10 +668,15 @@ export const interactionScenarios: readonly InteractionScenario[] = [
       await page.keyboard.press("Escape");
       await waitForControlUiRoute(page, { routeId: "new-session" });
     },
-    run: async (page) => {
+    run: async (page, gateway) => {
+      const schemaReads = (await gateway.getRequests("config.schema")).length;
       await page.keyboard.press("ControlOrMeta+Shift+,");
       await waitForControlUiRoute(page, { routeId: "appearance" });
       await page.locator(".settings-page").waitFor();
+      await frames(page);
+      if ((await gateway.getRequests("config.schema")).length !== schemaReads) {
+        throw new Error("Warm Settings must retain the loaded config schema");
+      }
     },
   },
   {
@@ -390,43 +688,82 @@ export const interactionScenarios: readonly InteractionScenario[] = [
       await settingsSection(page, "/settings/connection", "connection");
       await settingsSection(page, "/settings/appearance", "appearance");
     },
-    run: async (page) => {
+    run: async (page, gateway) => {
+      const schemaReads = (await gateway.getRequests("config.schema")).length;
       await settingsSection(page, "/settings/notifications", "notifications");
       await settingsSection(page, "/settings/connection", "connection");
       await settingsSection(page, "/settings/appearance", "appearance");
+      await frames(page);
+      if ((await gateway.getRequests("config.schema")).length !== schemaReads) {
+        throw new Error("Warm Settings tabs must retain the loaded config schema");
+      }
     },
   },
   {
     id: "model-picker-open-search",
     route: controlUiSessionPath(sessionKeys[0]),
     expected: "The 1,000-model picker opens and filters to Warm model 0999.",
-    prepare: async (page) => {
-      await prepareChat(page);
-      await page.locator(`${activePane} .agent-chat__input textarea`).first().click();
-      const trigger = page.locator(`${activePane} [data-chat-model-select]`);
-      await trigger.waitFor({ state: "visible" });
-      await trigger.click();
-      await page
-        .locator('[data-chat-model-option="example/model-999"]')
-        .waitFor({ state: "attached" });
-      await trigger.click();
-    },
+    prepare: prepareModelPicker,
     run: async (page) => {
       await page.locator(`${activePane} [data-chat-model-select]`).click();
-      await page.locator("[data-chat-model-search]").pressSequentially(modelQuery);
-      await page.locator('[data-chat-model-option="example/model-999"]').waitFor();
+      await searchModels(page);
+    },
+  },
+  {
+    id: "model-picker-navigate",
+    route: controlUiSessionPath(sessionKeys[0]),
+    expected: "Keyboard navigation advances through model choices and returns to the selected row.",
+    prepare: async (page) => {
+      await prepareModelPicker(page);
+      await page.locator(`${activePane} [data-chat-model-select]`).click();
+      await page.locator("[data-chat-model-search]").waitFor();
+      await frames(page);
+    },
+    run: async (page) => {
+      const search = page.locator("[data-chat-model-search]");
+      const initial = await search.getAttribute("aria-activedescendant");
+      if (!initial) {
+        throw new Error("Expected the selected model to be the initial active descendant");
+      }
+      await search.press("ArrowDown");
       await page.waitForFunction(
-        () =>
-          [...document.querySelectorAll<HTMLElement>("[data-chat-model-option]")].filter((option) =>
-            option.checkVisibility(),
-          ).length === 1,
+        (id) =>
+          document
+            .querySelector("[data-chat-model-search]")
+            ?.getAttribute("aria-activedescendant") !== id,
+        initial,
+      );
+      for (let index = 0; index < 9; index++) {
+        await search.press("ArrowDown");
+      }
+      for (let index = 0; index < 10; index++) {
+        await search.press("ArrowUp");
+      }
+      await page.waitForFunction(
+        (id) =>
+          document
+            .querySelector("[data-chat-model-search]")
+            ?.getAttribute("aria-activedescendant") === id,
+        initial,
       );
     },
+  },
+  {
+    id: "model-picker-search",
+    route: controlUiSessionPath(sessionKeys[0]),
+    expected: "The already-open 1,000-model picker filters to Warm model 0999.",
+    prepare: async (page) => {
+      await prepareModelPicker(page);
+      await page.locator(`${activePane} [data-chat-model-select]`).click();
+      await page.locator("[data-chat-model-search]").waitFor();
+      await frames(page);
+    },
+    run: searchModels,
   },
   ...(["sessions", "cron"] as const).map((route): InteractionScenario => ({
     id: `${route}-open`,
     route: "/new",
-    expected: `The warm ${route} route opens from the Pages navigation.`,
+    expected: `The warm ${route} route opens its default window from the Pages navigation.`,
     prepare: async (page, gateway) => warmRoute(page, gateway, route),
     run: async (page, gateway) => {
       await (await routeLink(page, route)).click();
@@ -471,6 +808,31 @@ export const interactionScenarios: readonly InteractionScenario[] = [
       await page.waitForFunction(
         () => document.querySelectorAll(".sessions-table tbody .session-data-row").length === 1,
       );
+    },
+  },
+  {
+    id: "cron-search-typing-pending",
+    route: pathForRoute("cron"),
+    expected: "Typing updates the filter while one held request retains all 500 jobs.",
+    prepare: async (page, gateway) => {
+      await prepareCron(page);
+      await page.getByRole("searchbox", { name: "Search automations" }).click();
+      await gateway.deferNext("cron.list");
+    },
+    run: async (page, gateway) => {
+      const before = (await gateway.getRequests("cron.list")).length;
+      const search = page.getByRole("searchbox", { name: "Search automations" });
+      await search.pressSequentially(cronQuery);
+      await gateway.waitForRequest("cron.list", { match: { query: "W", offset: 0 } });
+      await frames(page);
+      if (
+        (await search.inputValue()) !== cronQuery ||
+        (await page.locator(".cron-table__row").count()) !== 500 ||
+        (await page.locator(".cron-table").getAttribute("aria-busy")) !== "true" ||
+        (await gateway.getRequests("cron.list")).length - before !== 1
+      ) {
+        throw new Error("Expected the typed filter and 500 retained rows with one pending request");
+      }
     },
   },
   {

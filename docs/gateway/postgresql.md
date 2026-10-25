@@ -132,12 +132,16 @@ When present, the local credential store is captured as a fixed-local resource,
 outside the engine families. User backups apply its credential sanitization;
 updater recovery captures it exactly.
 
-Existing-state reads and one-shot writes reuse a small per-worker cache of idle
-PostgreSQL connections. Each caller has exclusive use until close; an open
-transaction is never returned to the cache. Connection settings and the store
+Existing-state reads, one-shot writes, and read-only agent database opens such
+as session loads reuse a small per-worker cache of idle PostgreSQL connections.
+Agent database owners and maintenance opens keep their own connection. Each
+caller has exclusive use until close; an open transaction is never returned to
+the cache. Connection settings and the store
 namespace separate cache entries. Session setup runs when a backend connects,
 and an idle connection lost by the server is replaced at the next open. Workers
-close their cached connections on shutdown.
+close their cached connections after three minutes idle or on shutdown. Taking a
+connection from the cache cancels its idle timeout; checked-out connections are
+not expired by this cache.
 
 Usage reports retain their reader in the existing history worker between requests.
 Each report still uses a fresh read snapshot; database maintenance and worker
@@ -467,6 +471,11 @@ The dry run inventories sources and checks read-only prerequisites. It does not
 create a recovery manifest, copy data, create destination namespaces, or complete
 checks that need private migration or a privilege probe. `--json` is available.
 
+Empty retained retired tables such as `fleet_cells` are skipped with an inspection
+note. Populated retired tables refuse the port so their rows cannot be silently
+discarded; preserve the SQLite store and archive the retired data through its owner
+before retrying. Unrecognized tables still require complete descriptor coverage.
+
 The real port includes registered shared-state, agent, Workboard, Logbook, and
 Team Reports stores, including retained roots and disabled plugin data. Keep
 matching separately installed plugins available so their schema owners can be
@@ -476,13 +485,18 @@ stores are privately migrated and verified; config switches last and preserves
 SecretRefs. Retain the captures until recovery is confirmed.
 
 Cold transcript references and file-artifact paths remain in place. Rebuildable
-memory indexes are omitted from the agent port; canonical memory origins and
-tombstones are retained. Their automatic rebuild hook is still pending. While
-the Gateway is still stopped, rebuild and check Memory Core before relying on
-recall:
+memory indexes are omitted from the agent port; canonical memory origins,
+tombstones, and the embedding cache are retained. After publication releases
+port ownership, the command acquires fresh offline ownership and rebuilds each
+ported agent through the selected memory plugin. Unchanged cached chunks reuse
+their embeddings. Per-agent results appear in the command output and `--json`.
+
+A rebuild failure warns without failing the completed port and includes
+`openclaw memory index --agent <id>` to retry while the Gateway remains stopped.
+Retained stores outside the active agent configuration require that original
+configuration before rebuilding. Check Memory Core before relying on recall:
 
 ```bash
-openclaw memory index
 openclaw memory status
 ```
 
@@ -696,15 +710,18 @@ or restore a matched backup. Never edit version/fingerprint metadata. Doctor's
 state migrations take their own exact backup before mutation.
 
 First boot, ports, rebuilds, and migrations can take longer on slow disks or a
-remote server. Connection and lock waits allow 60 seconds; the engine sets a
-90-second statement timeout and a 120-second synchronous bridge deadline.
-These are not per-operation config options. A timeout is a failure to investigate,
-not permission to delete recovery state. Inspect server load, locks, network, and
-storage, and retry only after resolving the reported cause.
+remote server. Connection waits allow 60 seconds. On its own connections,
+OpenClaw sets session-level `lock_timeout` to 60 seconds and `statement_timeout`
+to 90 seconds. These liveness bounds override role and database defaults; the
+synchronous bridge also has a 120-second deadline. These are not per-operation
+config options. A timeout is a failure to investigate, not permission to delete
+recovery state. Inspect server load, locks, network, and storage, and retry only
+after resolving the reported cause.
 
-OpenClaw uses the server's `synchronous_commit` setting. PostgreSQL's default
-`on` makes acknowledged commits durable across PostgreSQL or operating-system
-crashes. For SQLite WAL `synchronous=NORMAL`-like throughput, operators can opt in
+OpenClaw inherits the operator's `synchronous_commit` and other durability
+settings. PostgreSQL's default `on` makes acknowledged commits durable across
+PostgreSQL or operating-system crashes. For SQLite WAL
+`synchronous=NORMAL`-like throughput, operators can opt in
 with `ALTER ROLE <openclaw_role> SET synchronous_commit = off` or the equivalent
 `ALTER DATABASE` setting. This can lose recently acknowledged commits on a server
 or operating-system crash, without corruption. Ports and backups always commit
@@ -714,8 +731,17 @@ durably.
 
 Full text uses PostgreSQL's `simple` plus `unaccent` configuration and native
 ranking. Trigram mode performs literal contains matching with native similarity
-ranking. Semantic retrieval uses exact cosine distance through pgvector; it does
-not create an approximate-nearest-neighbor index.
+ranking. Memory vector search is approximate: a stored binary sketch provides a
+fast Hamming-distance prefilter, followed by exact float32 cosine reranking
+through pgvector. Model, source and exclusion filters apply before preselection;
+small candidate-ID scopes use exact search. This recall-tuned behavior is on by
+default with no extra configuration option. SQLite memory vector search stays
+exact, so semantic neighbors need not match across engines.
+
+Semantic memory requires pgvector 0.7 or newer. The agent schema migration
+backfills the generated sketches without building an HNSW index; ordinary writes
+maintain them automatically. Canonical embeddings, zero-vector eligibility and
+the result shape are unchanged, and backup/port operations rebuild the sketches.
 
 Scores and tokenization are engine-local. Expect different ordering from SQLite
 BM25, particularly for punctuation, compound words, and Unicode. Hybrid retrieval
@@ -763,6 +789,10 @@ load; the remaining roughly 5% difference was confounded by optional cost-summar
 work. Measure network latency, concurrency and server load for your deployment.
 
 ## Monitoring and troubleshooting
+
+Startup rejects invalid configuration before readiness and reports the fields that
+need repair. For retired settings such as `agents.defaults.heartbeat`, run
+`openclaw doctor --fix` before starting the Gateway again.
 
 ### Read the Doctor and status store report
 

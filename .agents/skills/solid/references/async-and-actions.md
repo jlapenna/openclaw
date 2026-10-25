@@ -16,6 +16,14 @@ agent scope, generations, mutation ordering, revision conflicts, and recorded
 outcomes. Solid owns readiness, keyed presentation, and temporary optimistic
 values. A projection or action must never become a second Gateway authority.
 
+Other current examples cover distinct contracts: [Config readiness](../../../../ui/src/pages/config/view.tsx)
+observes an admitted schema receipt while retaining the editor;
+[WhatsApp Settings](../../../../extensions/whatsapp/browser/settings.tsx) presents
+owner commands under a retryable error slot; and the
+[input dialog](../../../../ui/src/components/input-dialog.tsx) separates
+returned validation text from a rejected callback. Choose the matching contract
+rather than adding an action to every asynchronous operation.
+
 ## Read a Gateway-owned resource
 
 An async memo returns a promise; its accessor reads the resolved value. There
@@ -389,15 +397,15 @@ const invalid = createMemo(
   () =>
     completion()?.then(
       (value) => Boolean(value),
-      () => false,
+      () => true,
     ) ?? false,
   { loadingValue: false },
 );
 ```
 
-A callback rejection does not mark the objective invalid; only expected returned
-validation feedback does. Bind `aria-invalid` from `!saving() && invalid()` on the
-retained input. Inside
+A returned validation message or callback rejection marks the retained input
+invalid after settlement. Bind `aria-invalid` from `!saving() && invalid()`;
+rejections still reach `Errored` rather than becoming validation strings. Inside
 the narrow `Errored` slot, show a returned `message()` as ordinary validation
 feedback. The initial loading values cover first readiness; the saving checks
 avoid reading either derivation while an attempt is pending. Hide only the alert
@@ -460,6 +468,11 @@ A catch that starts after `await showConfirmDialog(...)` or `showInputDialog(...
 leaves preparation failures unobserved by a void event caller. Keep those awaits
 inside the existing outcome owner's error path, and retain its current-scope checks
 after they settle; generic confirmation behavior does not need to change.
+
+Independent work needs separate completion slots when its retry lifetimes differ.
+Provider review's modal preload must not replace a pending or failed continuation
+or status-check completion. Reopening retries preparation; only an explicit command
+retry retires that command's feedback.
 
 ## Key a projection over an owner snapshot
 
